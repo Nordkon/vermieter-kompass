@@ -195,7 +195,7 @@ function App() {
     'vermieter-demo-account-entries',
     [],
   );
-  const [migrationIssues] = useLocalStorage('vermieter-demo-migration-issues', []);
+  const [migrationIssues, setMigrationIssues] = useLocalStorage('vermieter-demo-migration-issues', []);
   const [tutorialProgress, setTutorialProgress] = useLocalStorage(
     'vermieter-demo-tutorial-progress',
     EMPTY_TUTORIAL_PROGRESS,
@@ -877,7 +877,24 @@ function App() {
         migrationIssues: [],
         tutorialProgress: EMPTY_TUTORIAL_PROGRESS,
       });
-      window.location.reload();
+      setProperties([]);
+      setTransactions([]);
+      setUnits([]);
+      setContacts([]);
+      setTenancies([]);
+      setDocuments([]);
+      setTenancyParties([]);
+      setTenancyUnits([]);
+      setRecurringRules([]);
+      setAccountEntries([]);
+      setMigrationIssues([]);
+      setTutorialProgress(EMPTY_TUTORIAL_PROGRESS);
+      setSelectedPropertyId('');
+      setTenantTarget(null);
+      setActiveView('dashboard');
+      setSidebarOpen(false);
+      setToast('Fachdaten wurden geleert. Die Kategorien bleiben erhalten.');
+      window.setTimeout(() => setToast(''), 3600);
     } catch {
       setToast('Fachdaten wurden nicht geleert. Der bisherige Datenstand bleibt erhalten.');
     }
@@ -915,7 +932,24 @@ function App() {
         migrationIssues: [],
         tutorialProgress: EMPTY_TUTORIAL_PROGRESS,
       });
-      window.location.reload();
+      setProperties(demoProperties);
+      setTransactions(demoTransactions);
+      setUnits(demoUnits);
+      setContacts(demoContacts);
+      setTenancies(demoTenancies);
+      setDocuments(demoDocuments);
+      setTenancyParties(demoTenancyParties);
+      setTenancyUnits(demoTenancyUnits);
+      setRecurringRules(demoRecurringRules);
+      setAccountEntries(demoAccountEntries);
+      setMigrationIssues([]);
+      setTutorialProgress(EMPTY_TUTORIAL_PROGRESS);
+      setSelectedPropertyId(demoProperties[0]?.id || '');
+      setTenantTarget(null);
+      setActiveView('dashboard');
+      setSidebarOpen(false);
+      setToast('Geprüfter Musterbestand wurde geladen.');
+      window.setTimeout(() => setToast(''), 3600);
     } catch {
       setToast('Musterbestand wurde nicht geladen. Der bisherige Datenstand bleibt erhalten.');
     }

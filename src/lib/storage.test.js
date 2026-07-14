@@ -1,7 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ensureRentalSchema, writeRentalSlicesAtomically } from './storage.js';
+import {
+  demoAccountEntries,
+  demoCategories,
+  demoContacts,
+  demoDocuments,
+  demoProperties,
+  demoRecurringRules,
+  demoTenancies,
+  demoTenancyParties,
+  demoTenancyUnits,
+  demoTransactions,
+  demoUnits,
+} from '../data/demoData.js';
+import {
+  ensureRentalSchema,
+  readRentalStorageSnapshot,
+  writeRentalSlicesAtomically,
+} from './storage.js';
 
 class LocalStorageFake {
   constructor(seed = {}, failOnKey = '') {
@@ -172,4 +189,47 @@ test('Unterbrochene Migration ist wiederaufnehmbar und bewahrt das erste Backup'
   for (const key of keysToCompare) {
     assert.deepEqual(JSON.parse(interrupted.getItem(key)), JSON.parse(clean.getItem(key)), key);
   }
+});
+
+test('Gepruefter Musterbestand wird aus einem leeren v4-Browser vollstaendig atomar geladen', () => {
+  global.window = { localStorage: new LocalStorageFake() };
+  ensureRentalSchema({
+    properties: [], transactions: [], categories: demoCategories,
+    units: [], contacts: [], tenancies: [], documents: [], generateUnitsForProperty: () => [],
+  }, '2026-07-14T12:00:00.000Z');
+
+  writeRentalSlicesAtomically({
+    properties: demoProperties,
+    transactions: demoTransactions,
+    units: demoUnits,
+    contacts: demoContacts,
+    tenancies: demoTenancies,
+    documents: demoDocuments,
+    tenancyParties: demoTenancyParties,
+    tenancyUnits: demoTenancyUnits,
+    recurringRules: demoRecurringRules,
+    accountEntries: demoAccountEntries,
+    migrationIssues: [],
+    tutorialProgress: { status: 'idle', step: 0 },
+  });
+
+  const snapshot = readRentalStorageSnapshot();
+  assert.equal(snapshot.schemaVersion, 4);
+  assert.equal(snapshot.properties.length, 1);
+  assert.equal(snapshot.units.length, 1);
+  assert.equal(snapshot.contacts.length, 2);
+  assert.equal(snapshot.tenancies.length, 1);
+  assert.equal(snapshot.recurringRules.length, 2);
+  assert.equal(snapshot.accountEntries.length, 38);
+  assert.equal(snapshot.documents.length, 5);
+
+  const debit = snapshot.accountEntries
+    .filter((entry) => entry.side === 'debit')
+    .reduce((total, entry) => total + entry.amount, 0);
+  const credit = snapshot.accountEntries
+    .filter((entry) => entry.side === 'credit')
+    .reduce((total, entry) => total + entry.amount, 0);
+  assert.equal(debit, 11700);
+  assert.equal(credit, 11580);
+  assert.equal(debit - credit, 120);
 });
