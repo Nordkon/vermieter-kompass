@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { CategoryFilterOptions } from './components/CategoryFilterOptions.jsx';
 import { CategorySelectOptions } from './components/CategorySelectOptions.jsx';
 import { CardHeader, ContextFact, Legend, MetricCard } from './components/CommonUi.jsx';
 import { DocumentList } from './components/DocumentList.jsx';
@@ -23,8 +24,10 @@ import {
   demoTransactions,
   demoUnits,
 } from './data/demoData.js';
+import { categoryMatchesFilter, categoryPathNames } from './lib/categoryFilter.js';
 import { formatDate, money, moneyExact, number, shortMonth } from './lib/format.js';
 import { readFile } from './lib/files.js';
+import { matchesGermanSearch } from './lib/germanSearch.js';
 import {
   activeTenancyForUnit,
   allocationLabel,
@@ -1173,6 +1176,7 @@ function App() {
                 units={units}
                 tenancies={tenancies}
                 tenancyUnits={tenancyUnits}
+                tenancyParties={tenancyParties}
                 contacts={contacts}
                 onAdd={() => properties.length && setTransactionModal({})}
                 onOpenTransaction={setTransactionDetail}
@@ -2289,6 +2293,7 @@ function TransactionsPage({
   units,
   tenancies,
   tenancyUnits,
+  tenancyParties = [],
   contacts,
   onAdd,
   onOpenTransaction,
@@ -2297,6 +2302,7 @@ function TransactionsPage({
   const [propertyFilter, setPropertyFilter] = useState('all');
   const [unitFilter, setUnitFilter] = useState('all');
   const [tenancyFilter, setTenancyFilter] = useState('all');
+  const [categoryFilter, setCategoryFilter] = useState('all');
   const [allocationFilter, setAllocationFilter] = useState('all');
   const [search, setSearch] = useState('');
 
@@ -2317,16 +2323,57 @@ function TransactionsPage({
         )
         .filter((transaction) => transactionMatchesUnit(transaction, unitFilter))
         .filter((transaction) => transactionMatchesTenancy(transaction, tenancyFilter))
+        .filter((transaction) => categoryMatchesFilter(transaction.categoryId, categoryFilter, categories))
         .filter((transaction) => allocationFilter === 'all' || (
           allocationFilter === 'allocatable'
             ? transaction.allocatable === true
             : transaction.kind !== 'expense' || transaction.allocatable !== true
         ))
-        .filter((transaction) =>
-          transaction.description.toLowerCase().includes(search.toLowerCase()),
-        )
+        .filter((transaction) => {
+          const property = properties.find((item) => item.id === transaction.propertyId);
+          const relatedUnitIds = new Set([
+            transaction.unitId,
+            ...(transaction.allocations || []).map((allocation) => allocation.unitId),
+          ].filter(Boolean));
+          const relatedTenancyIds = new Set([
+            transaction.tenancyId,
+            ...(transaction.allocations || []).map((allocation) => allocation.tenancyId),
+          ].filter(Boolean));
+          const relatedUnits = units.filter((unit) => relatedUnitIds.has(unit.id));
+          const relatedTenancies = tenancies.filter((tenancy) => relatedTenancyIds.has(tenancy.id));
+          const relatedPartyRelations = tenancyParties.filter((party) =>
+            relatedTenancyIds.has(party.tenancyId));
+          const relatedContactIds = new Set(
+            relatedPartyRelations.map((party) => party.contactId).filter(Boolean),
+          );
+          relatedTenancies.forEach((tenancy) => {
+            const hasPartyRelations = relatedPartyRelations.some((party) =>
+              party.tenancyId === tenancy.id);
+            if (!hasPartyRelations) {
+              (tenancy.contactIds || []).forEach((contactId) => relatedContactIds.add(contactId));
+            }
+          });
+          const relatedContacts = contacts.filter((contact) => relatedContactIds.has(contact.id));
+
+          return matchesGermanSearch(search, [
+            transaction.description,
+            transaction.receiptName,
+            transaction.date,
+            formatDate(transaction.date),
+            transaction.amount,
+            moneyExact.format(transaction.amount),
+            categoryPathNames(transaction.categoryId, categories),
+            property?.name,
+            property?.shortName,
+            property?.address,
+            property?.postalCode,
+            property?.city,
+            relatedUnits.map((unit) => unit.name),
+            relatedContacts.map((contact) => contact.name),
+          ]);
+        })
         .sort((a, b) => b.date.localeCompare(a.date)),
-    [transactions, kindFilter, propertyFilter, unitFilter, tenancyFilter, allocationFilter, search],
+    [transactions, kindFilter, propertyFilter, unitFilter, tenancyFilter, categoryFilter, allocationFilter, search, categories, contacts, properties, tenancies, tenancyParties, units],
   );
 
   return (
@@ -2349,11 +2396,15 @@ function TransactionsPage({
             <Icon name="search" size={18} />
             <input
               type="search"
-              placeholder="Buchungen durchsuchen …"
+              placeholder="Beschreibung, Kategorie, Objekt durchsuchen …"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
             />
           </label>
+          <select aria-label="Kategorie filtern" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}>
+            <option value="all">Alle Kategorien</option>
+            <CategoryFilterOptions categories={categories} />
+          </select>
           <select
             aria-label="Buchungsart filtern"
             value={kindFilter}
