@@ -25,6 +25,18 @@ Die Hauptnavigation folgt dem fachlichen Arbeitsablauf:
 - Haupt- und Nebeneinheit können gemeinsam einem Mietverhältnis zugeordnet werden.
 - Überschneidende Vertragszeiträume derselben Einheit werden beim Anlegen verhindert; beendete Verträge bleiben als Historie erhalten.
 
+### Objektarbeitsfläche
+
+- In der geöffneten Immobilie bleibt ein kompakter Objektkopf mit Anschrift, Einheitenstatus sowie Plan- und Vertragsmieten über allen Objektbereichen sichtbar.
+- Die drei zugänglichen Tabs **Übersicht**, **Objektakte** und **Finanzen & Belege** trennen Kennzahlen, Objektbaum beziehungsweise Aktenkontext und die gefilterten Buchungen. Die Tabs lassen sich auch mit Pfeiltasten, Pos1 und Ende bedienen.
+- Aktiver Tab, Baumzustand, Kontext sowie Finanzsuche und -filter bleiben je Immobilie während der aktuellen Sitzung erhalten. Sie werden bewusst nicht in LocalStorage geschrieben und beginnen nach einem Browser-Reload frisch.
+- Aktionen aus Objekt, Einheit, Mietverhältnis oder Mietpartei können direkt in die Finanzansicht wechseln. Der Kontext wird deterministisch auf Immobilien-, Einheiten- und Mietverhältnisfilter abgebildet; gemeinsam vermietete Nebeneinheiten bleiben über den Vertragsfilter erfasst.
+- Buchungsvorschau und Buchungserfassung öffnen als nicht-modale Arbeitsfenster. Auf großen Ansichten lassen sie sich verschieben, links, mittig oder rechts andocken, in festen Größen anzeigen und in eine Taskbar minimieren. Bis einschließlich 760 Pixel Breite werden sie als Bottom Sheet dargestellt.
+- Ein minimierter Buchungsentwurf bewahrt Eingaben, ausgewählte Datei, manuelle Verteilung, Status und Fehlermeldung auch beim Wechsel der Hauptnavigation. Dieser Entwurf lebt nur im aktuellen React-Lauf: Ein Browser-Reload stellt ein offenes Arbeitsfenster oder einen ungespeicherten Entwurf **nicht** wieder her.
+- Eine Buchungsvorschau kann parallel zum Editor geöffnet bleiben. Solange ein Editor existiert, ist die Vorschau schreibgeschützt; Löschen und Dokumentanhang sind dort gesperrt, der Originalbeleg bleibt lesbar.
+- Das bidirektionale One-writer-Gate lässt höchstens einen schreibenden Editor zu: Eine weitere Schreibaktion aktiviert den vorhandenen Editor, und mutierende Vorschauaktionen starten keinen zweiten Schreibpfad. Eine neue Vorschau ersetzt lediglich die bisherige Vorschau.
+- Ungespeicherte Änderungen werden beim Schließen in der Arbeitsfläche bestätigt. Es gibt keinen blockierenden Browserdialog; erst **Entwurf verwerfen** entfernt den kontrollierten Entwurf.
+
 ### Mieterbereich
 
 - Suche und Filter für Mietparteien, Mietverhältnisse und Kontobuchungen.
@@ -157,7 +169,7 @@ Alle Node-Smoke- und Fachlogiktests ausführen:
 npm.cmd test
 ```
 
-Die Tests decken unter anderem Migration und Wiederaufnahme, Referenzvalidierung, Dublettenschutz der Wiederholungsregeln, Mieterkonto, Leistungszeitraum-Verteilung und die reinen Helfer des Mieterbereichs ab.
+Die Tests decken unter anderem Migration und Wiederaufnahme, Referenzvalidierung, Dublettenschutz der Wiederholungsregeln, Mieterkonto, Leistungszeitraum-Verteilung, deutsche Finanzsuche und Kategorienhierarchie sowie die reinen Helfer des Mieterbereichs ab. `workspaceModel.test.js` prüft zusätzlich One-writer-Gate, Vorschauersatz, Dirty- und Editorpayload, Minimierung, Docks, Größen, Viewport-Clamp und Responsive-Grenzen. `propertyWorkspace.test.js` sichert deterministische Top-5-Kontextbewegungen, das Kontext-zu-Finanzfilter-Mapping und den normalisierten sitzungsbezogenen Objektzustand. Die verbindlichen sichtbaren Prüfungen stehen in `docs/UX_TEST_CATALOG.md`.
 
 Produktions-Build erstellen und lokal prüfen:
 
@@ -192,7 +204,9 @@ Die Veröffentlichung stellt ausschließlich die statische Demo bereit. Alle ein
 ```text
 src/
   components/
+    property/                Zugängliche Tabs der Immobilienarbeitsfläche
     tenants/                 Mieterbereich, Kontaktakte, Verträge und Mieterkonten
+    workspace/               Nicht-modale Fenster, Taskbar, Buchungseditor und Vorschau
     DocumentsPage.jsx        Zentrale Dokumentenansicht
     RecurringRulesPanel.jsx  Wiederkehrende Sollstellungen
     weitere UI-Bausteine
@@ -202,9 +216,11 @@ src/
     schemaV4.js              v4-Vertrag und deterministische v3→v4-Migration
     annualSettlement.js      Jahresvorschau und dublettengeschützter Abschluss
     paymentLink.js           Atomare Zahlung↔Einnahmen-Beziehung
+    propertyWorkspace.js     Kontextbewegungen und Übergabe an Finanzfilter
     storage.js               LocalStorage-Anbindung und sichere Migration
     rentalModel.js           Einheiten-, Vertrags- und Kostenverteilungslogik
     tenantAreaModel.js       Reine Helfer für den Mieterbereich
+    workspaceModel.js        Fensterzustände, One-writer-Gate, Docks und Viewport-Clamp
     format.js                Deutsche Zahlen-, Datums- und Währungsformate
     *.test.js                Node-Smoke- und Fachlogiktests
   App.jsx                    Integration, Navigation und bestehende Ansichten

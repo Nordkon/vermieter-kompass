@@ -1,14 +1,21 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { CategoryFilterOptions } from './components/CategoryFilterOptions.jsx';
 import { CategorySelectOptions } from './components/CategorySelectOptions.jsx';
 import { CardHeader, ContextFact, Legend, MetricCard } from './components/CommonUi.jsx';
 import { DocumentList } from './components/DocumentList.jsx';
 import { DocumentsPage } from './components/DocumentsPage.jsx';
 import { Icon } from './components/Icon.jsx';
+import { PropertyTabs } from './components/property/PropertyTabs.jsx';
 import { RecurringRulesPanel } from './components/RecurringRulesPanel.jsx';
 import { ContactRecord } from './components/tenants/ContactRecord.jsx';
 import { TenantArea } from './components/tenants/TenantArea.jsx';
 import { TutorialCoach, TutorialSettingsCard } from './components/TutorialCoach.jsx';
+import {
+  TransactionEditorWindow,
+  TransactionPreviewWindow,
+  WorkspaceTaskbar,
+  WorkspaceWindow,
+} from './components/workspace/index.js';
 import {
   DEMO_YEAR,
   demoCategories,
@@ -47,6 +54,11 @@ import {
   unitPlanSummary,
 } from './lib/propertyModel.js';
 import {
+  normalizePropertySessionState,
+  propertyContextToFinanceFilters,
+  topPropertyContextMovements,
+} from './lib/propertyWorkspace.js';
+import {
   buildLinkedTenantPayment,
   isLinkedTenantPaymentTransaction,
   voidLinkedTenantPayment,
@@ -69,6 +81,7 @@ import {
   finishTutorialStep,
   startTutorialProgress,
 } from './lib/tutorialModel.js';
+import { validateTransactionWorkspaceSave } from './lib/transactionWorkspace.js';
 import {
   contextLabel,
   firstSelectableCategory,
@@ -78,6 +91,20 @@ import {
   sum,
   tenancyStateLabel,
 } from './lib/viewHelpers.js';
+import {
+  clampWindowRect,
+  closeWorkspaceWindow,
+  createWorkspaceState,
+  minimizeWorkspaceWindow,
+  openWorkspaceWindow,
+  restoreWorkspaceWindow,
+  setWorkspaceDirty,
+  setWorkspacePlacement,
+  updateWorkspacePayload,
+  workspaceEditor,
+  workspaceResponsiveMode,
+} from './lib/workspaceModel.js';
+import { transactionWriterAvailability, updateWriterOwner } from './lib/writerGate.js';
 
 ensureRentalSchema({
   properties: [],
@@ -159,6 +186,15 @@ function nextRentDueDate(contractStart, dueDay = 3) {
   return dueDate;
 }
 
+function tenancyContactIdsFromRelations(tenancy, tenancyParties = []) {
+  const relatedIds = tenancyParties
+    .filter((party) => party.tenancyId === tenancy?.id)
+    .sort((left, right) => Number(left.sortOrder || 0) - Number(right.sortOrder || 0))
+    .map((party) => party.contactId)
+    .filter(Boolean);
+  return relatedIds.length ? relatedIds : tenancy?.contactIds || [];
+}
+
 function App() {
   const [properties, setProperties] = useLocalStorage(
     'vermieter-demo-properties',
@@ -206,14 +242,25 @@ function App() {
   const [activeView, setActiveView] = useState('dashboard');
   const [selectedPropertyId, setSelectedPropertyId] = useState(properties[0]?.id || '');
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [transactionModal, setTransactionModal] = useState(null);
+  const [workspace, setWorkspace] = useState(() => createWorkspaceState());
+  const [discardWindowId, setDiscardWindowId] = useState('');
+  const [previewDeleteArmed, setPreviewDeleteArmed] = useState(false);
   const [propertyModal, setPropertyModal] = useState(false);
   const [unitModal, setUnitModal] = useState(null);
   const [documentModal, setDocumentModal] = useState(null);
   const [documentDetail, setDocumentDetail] = useState(null);
-  const [transactionDetail, setTransactionDetail] = useState(null);
   const [toast, setToast] = useState('');
   const [tenantTarget, setTenantTarget] = useState(null);
+  const [externalWriter, setExternalWriter] = useState(null);
+  const [propertySessions, setPropertySessions] = useState({});
+  const workspaceTriggerRef = useRef(null);
+  const previewTriggerRef = useRef(null);
+
+  const editorWindow = workspaceEditor(workspace);
+  const previewWindow = workspace.windows.find((item) => item.mode === 'preview') || null;
+  const transactionDetail = previewWindow
+    ? transactions.find((item) => item.id === previewWindow.entityId) || null
+    : null;
 
   useEffect(() => {
     const handleStorageError = (event) => {
@@ -221,6 +268,46 @@ function App() {
     };
     window.addEventListener('vermieter-storage-error', handleStorageError);
     return () => window.removeEventListener('vermieter-storage-error', handleStorageError);
+  }, []);
+
+  useEffect(() => {
+    if (!editorWindow?.dirty) return undefined;
+    const warnBeforeUnload = (event) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warnBeforeUnload);
+    return () => window.removeEventListener('beforeunload', warnBeforeUnload);
+  }, [editorWindow?.dirty]);
+
+  useEffect(() => {
+    if (!previewWindow || transactionDetail) return;
+    setWorkspace((current) => closeWorkspaceWindow(current, previewWindow.id, { discardDirty: true }).state);
+  }, [previewWindow?.id, transactionDetail?.id]);
+
+  useEffect(() => {
+    const keepWorkspaceReachable = () => {
+      setWorkspace((current) => {
+        const viewport = { width: window.innerWidth, height: window.innerHeight };
+        const responsiveMode = workspaceResponsiveMode(viewport.width);
+        let windows = current.windows.map((item) => item.dock === 'floating'
+          ? { ...item, rect: clampWindowRect(item.rect, viewport) }
+          : item);
+        if (responsiveMode !== 'desktop') {
+          const expanded = windows.filter((item) => !item.minimized);
+          if (expanded.length > 1) {
+            const keepId = current.activeWindowId || expanded.at(-1)?.id;
+            windows = windows.map((item) => ({
+              ...item,
+              minimized: item.id === keepId ? false : item.minimized || expanded.some((open) => open.id === item.id),
+            }));
+          }
+        }
+        return { ...createWorkspaceState(windows), activeWindowId: current.activeWindowId };
+      });
+    };
+    window.addEventListener('resize', keepWorkspaceReachable);
+    return () => window.removeEventListener('resize', keepWorkspaceReachable);
   }, []);
 
   useEffect(() => {
@@ -271,25 +358,211 @@ function App() {
   }), [properties, tenancies, tenancyUnits, units]);
 
   const openProperty = (propertyId) => {
+    if (externalWriter?.dirty && !window.confirm(`${externalWriter.label}: ungespeicherte Änderungen verwerfen und die Seite wechseln?`)) return false;
+    setExternalWriter(null);
     setSelectedPropertyId(propertyId);
     setActiveView('detail');
     setSidebarOpen(false);
     window.scrollTo({ top: 0, behavior: 'smooth' });
+    return true;
   };
 
   const navigate = (view) => {
+    if (view !== activeView && externalWriter?.dirty
+      && !window.confirm(`${externalWriter.label}: ungespeicherte Änderungen verwerfen und die Seite wechseln?`)) return false;
+    if (view !== activeView) setExternalWriter(null);
     setActiveView(view);
     setSidebarOpen(false);
     window.scrollTo({ top: 0, behavior: 'smooth' });
+    return true;
+  };
+
+  const showTransientToast = (message, duration = 3600) => {
+    setToast(message);
+    window.setTimeout(() => setToast(''), duration);
+  };
+
+  const updateExternalWriter = (writer) => {
+    setExternalWriter((current) => updateWriterOwner(current, writer));
+  };
+
+  const updatePropertySession = (propertyId, session) => {
+    setPropertySessions((current) => ({ ...current, [propertyId]: session }));
+  };
+
+  const createTransactionDraft = (preset = {}) => {
+    const firstExpense = firstSelectableCategory(categories, 'expense') || categories[0];
+    const propertyId = properties.some((property) => property.id === preset.propertyId)
+      ? preset.propertyId
+      : properties[0]?.id || '';
+    const unitId = units.some((unit) => unit.id === preset.unitId && unit.propertyId === propertyId)
+      ? preset.unitId
+      : '';
+    return {
+      propertyId,
+      unitId,
+      date: new Date().toISOString().slice(0, 10),
+      kind: 'expense',
+      categoryId: firstExpense?.id || '',
+      description: '',
+      amount: '',
+      servicePeriodStart: '',
+      servicePeriodEnd: '',
+      allocatable: firstExpense?.allocatableDefault === true,
+      allocationMode: unitId ? 'direct' : firstExpense?.allocationModeDefault || 'area',
+    };
+  };
+
+  const focusWorkspaceWindow = (windowId) => {
+    setWorkspace((current) => {
+      let next = restoreWorkspaceWindow(current, windowId);
+      if (workspaceResponsiveMode(window.innerWidth) !== 'desktop') {
+        next = {
+          ...createWorkspaceState(next.windows.map((item) => (
+            item.id === windowId ? { ...item, minimized: false } : { ...item, minimized: true }
+          ))),
+          activeWindowId: windowId,
+        };
+      }
+      return next;
+    });
+  };
+
+  const minimizeWorkspaceAndFocusTask = (windowId) => {
+    setWorkspace((current) => minimizeWorkspaceWindow(current, windowId));
+    window.setTimeout(() => document.getElementById(`workspace-task-${windowId}`)?.focus?.({ preventScroll: true }), 0);
+  };
+
+  const blockCompetingWrite = (label = 'Diese Bearbeitung') => {
+    if (!editorWindow) return false;
+    focusWorkspaceWindow(editorWindow.id);
+    showTransientToast(`${label} ist gesperrt, solange der Buchungsentwurf offen ist. Bitte zuerst speichern oder verwerfen.`, 4600);
+    return true;
+  };
+
+  const blockNewWrite = (label = 'Diese Bearbeitung') => {
+    if (blockCompetingWrite(label)) return true;
+    if (!externalWriter) return false;
+    externalWriter.focusId && document.getElementById(externalWriter.focusId)?.focus?.({ preventScroll: true });
+    showTransientToast(`${label} ist gesperrt, solange „${externalWriter.label}“ geöffnet ist. Bitte zuerst speichern oder schließen.`, 4800);
+    return true;
+  };
+
+  const openTransactionEditor = (preset = {}) => {
+    if (!properties.length) {
+      showTransientToast('Lege zuerst eine Immobilie an. Danach kannst du eine Buchung erfassen.');
+      return;
+    }
+    const writerAvailability = transactionWriterAvailability({
+      externalWriter,
+      blockingModal: Boolean(propertyModal || unitModal || documentModal),
+    });
+    if (writerAvailability.reason === 'modal-active') {
+      showTransientToast('Bitte schließe zuerst die bereits geöffnete Bearbeitungsmaske. Danach kann die Buchungserfassung starten.', 4600);
+      return;
+    }
+    if (writerAvailability.reason === 'writer-active') {
+      externalWriter.focusId && document.getElementById(externalWriter.focusId)?.focus?.({ preventScroll: true });
+      showTransientToast(`${externalWriter.label} ist bereits geöffnet${externalWriter.dirty ? ' und enthält ungespeicherte Änderungen' : ''}. Bitte zuerst abschließen oder schließen.`, 4800);
+      return;
+    }
+    if (editorWindow) {
+      focusWorkspaceWindow(editorWindow.id);
+      showTransientToast('Der vorhandene Buchungsentwurf wurde wieder nach vorn geholt. Deine Eingaben bleiben erhalten.');
+      return;
+    }
+    workspaceTriggerRef.current = document.activeElement;
+    const width = window.innerWidth >= 1440 ? 640 : window.innerWidth >= 1180 ? 560 : 520;
+    const opened = openWorkspaceWindow(workspace, {
+      id: 'transaction-editor',
+      title: 'Buchung erfassen',
+      entityType: 'transaction',
+      mode: 'editor',
+      dock: 'right',
+      size: 'standard',
+      dirty: false,
+      rect: { x: Math.max(12, window.innerWidth - width - 16), y: 96, width, height: Math.min(720, window.innerHeight - 112) },
+      payload: {
+        status: 'open',
+        draft: createTransactionDraft(preset),
+        file: null,
+        manualAmounts: {},
+        error: '',
+      },
+    });
+    let next = opened.state;
+    if (workspaceResponsiveMode(window.innerWidth) !== 'desktop') {
+      next = createWorkspaceState(next.windows.map((item) => (
+        item.id === opened.windowId ? item : { ...item, minimized: true }
+      )));
+    }
+    setWorkspace(next);
+  };
+
+  const openTransactionPreview = (transaction) => {
+    if (!transaction) return;
+    previewTriggerRef.current = document.activeElement;
+    const opened = openWorkspaceWindow(workspace, {
+      id: `transaction-preview-${transaction.id}`,
+      title: transaction.description || 'Buchungsvorschau',
+      entityType: 'transaction',
+      entityId: transaction.id,
+      mode: 'preview',
+      dock: 'left',
+      size: 'preview',
+      rect: { x: 280, y: 116, width: window.innerWidth >= 1440 ? 480 : 420, height: Math.min(680, window.innerHeight - 132) },
+    });
+    let next = opened.state;
+    if (workspaceResponsiveMode(window.innerWidth) !== 'desktop') {
+      next = {
+        ...createWorkspaceState(next.windows.map((item) => (
+          item.id === opened.windowId ? { ...item, minimized: false } : { ...item, minimized: true }
+        ))),
+        activeWindowId: opened.windowId,
+      };
+    }
+    setPreviewDeleteArmed(false);
+    setWorkspace(next);
+  };
+
+  const requestWorkspaceClose = (windowId) => {
+    const target = workspace.windows.find((item) => item.id === windowId);
+    if (!target) return;
+    if (target.dirty) {
+      setDiscardWindowId(windowId);
+      focusWorkspaceWindow(windowId);
+      return;
+    }
+    const closed = closeWorkspaceWindow(workspace, windowId);
+    if (closed.ok) setWorkspace(closed.state);
+    if (target.mode === 'editor') workspaceTriggerRef.current?.focus?.({ preventScroll: true });
+    if (target.mode === 'preview') previewTriggerRef.current?.focus?.({ preventScroll: true });
+  };
+
+  const discardWorkspaceDraft = () => {
+    if (!discardWindowId) return;
+    const closed = closeWorkspaceWindow(workspace, discardWindowId, { discardDirty: true });
+    if (closed.ok) setWorkspace(closed.state);
+    setDiscardWindowId('');
+    workspaceTriggerRef.current?.focus?.({ preventScroll: true });
   };
 
   const openTenantRecord = ({ tab, contactId = '', tenancyId = '', unitId = '', origin = null }) => {
-    setTenantTarget({ tab, contactId, tenancyId, unitId, origin, nonce: Date.now() });
-    navigate('tenants');
+    if (navigate('tenants') !== false) {
+      setTenantTarget({ tab, contactId, tenancyId, unitId, origin, nonce: Date.now() });
+    }
   };
 
   const addTransaction = (transaction) => {
-    const storedTransaction = withTutorialTag(transaction);
+    const validation = validateTransactionWorkspaceSave(transaction, {
+      properties,
+      units,
+      categories,
+      tenancies,
+      tenancyUnits,
+    });
+    if (!validation.ok) return validation;
+    const storedTransaction = withTutorialTag(validation.value);
     const nextTransactions = [storedTransaction, ...transactions];
     let nextDocuments = documents;
     if (transaction.receiptName) {
@@ -308,21 +581,31 @@ function App() {
     try {
       writeRentalSlicesAtomically({ transactions: nextTransactions, documents: nextDocuments });
     } catch {
-      setToast('Buchung wurde nicht gespeichert. Bitte Speicherplatz freigeben oder den Beleg verkleinern.');
-      return false;
+      return { ok: false, error: 'Buchung wurde nicht gespeichert. Bitte Speicherplatz freigeben oder den Beleg verkleinern.' };
     }
     setTransactions(nextTransactions);
     setDocuments(nextDocuments);
-    setTransactionModal(null);
-    setToast('Buchung wurde lokal gespeichert.');
-    window.setTimeout(() => setToast(''), 3200);
-    return true;
+    showTransientToast('Buchung wurde lokal gespeichert.', 3200);
+    return { ok: true };
+  };
+
+  const saveWorkspaceTransaction = async (transaction) => {
+    const result = addTransaction(transaction);
+    if (!result.ok) return result;
+    setWorkspace((current) => {
+      const clean = setWorkspaceDirty(current, 'transaction-editor', false);
+      return closeWorkspaceWindow(clean, 'transaction-editor', { discardDirty: true }).state;
+    });
+    setDiscardWindowId('');
+    window.setTimeout(() => workspaceTriggerRef.current?.focus?.({ preventScroll: true }), 0);
+    return result;
   };
 
   const deleteTransaction = (transactionId) => {
+    if (blockNewWrite('Buchung löschen')) return;
     const transaction = transactions.find((item) => item.id === transactionId);
     if (isLinkedTenantPaymentTransaction(transaction)) {
-      setTransactionDetail(null);
+      if (previewWindow) requestWorkspaceClose(previewWindow.id);
       setToast('Verknüpfte Mietzahlungen werden nicht einzeln gelöscht. Nutze „Mietzahlung stornieren“ im Mieterkonto und buche sie bei Bedarf neu.');
       window.setTimeout(() => setToast(''), 4600);
       return;
@@ -339,12 +622,13 @@ function App() {
     }
     setTransactions(nextTransactions);
     setDocuments(nextDocuments);
-    setTransactionDetail(null);
+    if (previewWindow) requestWorkspaceClose(previewWindow.id);
     setToast('Buchung und direkt zugeordnete Belege wurden gelöscht.');
     window.setTimeout(() => setToast(''), 3200);
   };
 
   const addCategory = (category) => {
+    if (blockCompetingWrite('Kategorie anlegen')) return false;
     const parent = categories.find((item) => item.id === category.parentId);
     const nextCategories = [
       ...categories,
@@ -370,6 +654,7 @@ function App() {
   };
 
   const addProperty = (property) => {
+    if (blockCompetingWrite('Immobilie anlegen')) return false;
     if (properties.length >= 10) {
       setToast('Die Demo ist auf maximal 10 Immobilien begrenzt.');
       window.setTimeout(() => setToast(''), 3200);
@@ -417,6 +702,7 @@ function App() {
   };
 
   const addUnit = (unit) => {
+    if (blockCompetingWrite('Einheit bearbeiten')) return false;
     const id = unit.id || 'unit-' + Date.now();
     const candidate = withTutorialTag({ ...unit, id });
     const property = properties.find((item) => item.id === unit.propertyId);
@@ -445,6 +731,7 @@ function App() {
   };
 
   const saveContact = (payload) => {
+    if (blockCompetingWrite('Kontakt bearbeiten')) return false;
     const nextContacts = contacts.map((contact) => contact.id === payload.id ? {
       ...contact,
       ...payload,
@@ -464,6 +751,7 @@ function App() {
   };
 
   const createContact = (payload) => {
+    if (blockCompetingWrite('Mietpartei anlegen')) return false;
     const contact = withTutorialTag({ ...payload, id: 'contact-' + Date.now() });
     const nextContacts = [...contacts, contact];
     try {
@@ -479,6 +767,7 @@ function App() {
   };
 
   const createTenancy = (payload) => {
+    if (blockCompetingWrite('Mietverhältnis anlegen')) return false;
     const contract = payload.tenancy;
     const unitIds = payload.tenancyUnits.map((relation) => relation.unitId);
     if (tenancyHasIntervalConflict({
@@ -549,6 +838,7 @@ function App() {
   };
 
   const addAccountEntry = (entry) => {
+    if (blockCompetingWrite('Mieterkonto bearbeiten')) return false;
     const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     if (entry.occurrenceKey && accountEntries.some((item) => item.occurrenceKey === entry.occurrenceKey)) {
       setToast('Diese Kontobuchung ist für den Zeitraum bereits vorhanden.');
@@ -590,6 +880,7 @@ function App() {
   };
 
   const voidTenantPayment = (entry) => {
+    if (blockNewWrite('Mietzahlung stornieren')) return false;
     let next;
     try {
       next = voidLinkedTenantPayment({
@@ -614,6 +905,7 @@ function App() {
   };
 
   const generateAccountEntries = ({ throughDate, tenancyId }) => {
+    if (blockNewWrite('Sollstellungen erzeugen')) return false;
     const selectedRules = tenancyId
       ? recurringRules.filter((rule) => rule.tenancyId === tenancyId)
       : recurringRules;
@@ -639,6 +931,7 @@ function App() {
   };
 
   const createRecurringRule = (rule) => {
+    if (blockCompetingWrite('Wiederholungsregel anlegen')) return false;
     const tenancy = tenancies.find((item) => item.id === rule.tenancyId);
     const today = new Date().toISOString().slice(0, 10);
     const normalized = normalizeRecurringRuleForTenancy(rule, tenancy, today);
@@ -670,6 +963,7 @@ function App() {
   };
 
   const endTenancy = (tenancyId) => {
+    if (blockNewWrite('Mietverhältnis beenden')) return false;
     const today = new Date().toISOString().slice(0, 10);
     const nextTenancies = tenancies.map((tenancy) =>
       tenancy.id === tenancyId
@@ -692,6 +986,7 @@ function App() {
   };
 
   const addDocument = (document) => {
+    if (blockCompetingWrite('Dokument anhängen')) return false;
     const nextDocuments = [withTutorialTag({ ...document, id: 'doc-' + Date.now() }), ...documents];
     try {
       writeRentalSlicesAtomically({ documents: nextDocuments });
@@ -753,7 +1048,7 @@ function App() {
     setTutorialProgress((current) => ({ ...current, open: false }));
     if (step.id === 'property') {
       navigate('properties');
-      setPropertyModal(true);
+      if (!blockNewWrite('Immobilie anlegen')) setPropertyModal(true);
       return;
     }
     if (step.id === 'units') {
@@ -779,7 +1074,7 @@ function App() {
     }
     if (step.id === 'annual') {
       navigate('transactions');
-      setTransactionModal({ propertyId: tutorialProperty?.id || selectedPropertyId });
+      openTransactionEditor({ propertyId: tutorialProperty?.id || selectedPropertyId });
       return;
     }
     if (step.id === 'documents') {
@@ -812,6 +1107,7 @@ function App() {
   };
 
   const cleanupTutorialData = () => {
+    if (blockNewWrite('Tutorialdaten bereinigen')) return;
     const sessionId = tutorialProgress.sessionId;
     if (!sessionId || !window.confirm('Nur die in diesem Tutorial markierten Übungsdaten entfernen? Bestehende Daten bleiben unangetastet.')) return;
     const plan = buildTutorialCleanupPlan({ properties, units, contacts, tenancies, transactions }, sessionId);
@@ -840,6 +1136,7 @@ function App() {
     if (propertyIds.has(selectedPropertyId)) setSelectedPropertyId(properties.find((item) => !propertyIds.has(item.id))?.id || '');
     setTenantTarget(null);
     setTutorialProgress(EMPTY_TUTORIAL_PROGRESS);
+    setWorkspace(createWorkspaceState());
     navigate('dashboard');
     setToast('Ausschließlich die markierten Übungsdaten wurden entfernt.');
     window.setTimeout(() => setToast(''), 3600);
@@ -863,6 +1160,7 @@ function App() {
   };
 
   const clearBusinessData = () => {
+    if (blockNewWrite('Fachdaten leeren')) return;
     if (!window.confirm('Vor dem Leeren wird automatisch ein JSON-Backup heruntergeladen. Danach werden alle Fachdaten entfernt; Kategorien bleiben erhalten. Fortfahren?')) return;
     downloadDataBackup('Fachdaten leeren');
     try {
@@ -896,6 +1194,7 @@ function App() {
       setTenantTarget(null);
       setActiveView('dashboard');
       setSidebarOpen(false);
+      setWorkspace(createWorkspaceState());
       setToast('Fachdaten wurden geleert. Die Kategorien bleiben erhalten.');
       window.setTimeout(() => setToast(''), 3600);
     } catch {
@@ -904,6 +1203,7 @@ function App() {
   };
 
   const loadVerifiedSample = () => {
+    if (blockNewWrite('Musterbestand laden')) return;
     const hasBusinessData = Boolean(
       properties.length
       || transactions.length
@@ -951,6 +1251,7 @@ function App() {
       setTenantTarget(null);
       setActiveView('dashboard');
       setSidebarOpen(false);
+      setWorkspace(createWorkspaceState());
       setToast('Geprüfter Musterbestand wurde geladen.');
       window.setTimeout(() => setToast(''), 3600);
     } catch {
@@ -1068,8 +1369,9 @@ function App() {
             <button
               type="button"
               className="button button--primary"
-              onClick={() => setTransactionModal({ propertyId: selectedPropertyId })}
+              onClick={() => openTransactionEditor({ propertyId: selectedPropertyId })}
               disabled={!properties.length}
+              aria-label="Neue Buchung"
               title={!properties.length ? 'Lege zuerst eine Immobilie an.' : undefined}
             >
               <Icon name="plus" size={18} />
@@ -1087,7 +1389,7 @@ function App() {
               unitRecords={units}
               onOpenProperty={openProperty}
               onNavigate={navigate}
-              onOpenTransaction={setTransactionDetail}
+              onOpenTransaction={openTransactionPreview}
             />
           )}
           {activeView === 'properties' && (
@@ -1095,32 +1397,45 @@ function App() {
               properties={displayProperties}
               transactions={transactions}
               onOpenProperty={openProperty}
-              onAdd={() => setPropertyModal(true)}
+              onAdd={() => {
+                if (!blockNewWrite('Immobilie anlegen')) setPropertyModal(true);
+              }}
             />
           )}
           {activeView === 'detail' && selectedProperty && (
             <PropertyDetail
+              key={selectedProperty.id}
               property={selectedProperty}
               transactions={transactions}
               categories={categories}
               units={units.filter((unit) => unit.propertyId === selectedProperty.id)}
               contacts={contacts}
               tenancies={tenancies}
+              tenancyParties={tenancyParties}
               tenancyUnits={tenancyUnits}
               documents={documents}
               onBack={() => navigate('properties')}
-              onAdd={(unitId) => setTransactionModal({ propertyId: selectedProperty.id, unitId })}
-              onAddUnit={() => setUnitModal({ propertyId: selectedProperty.id })}
-              onEditUnit={(unitId) => setUnitModal({ propertyId: selectedProperty.id, unitId })}
-              onAddTenancy={(unitId) => openTenantRecord({ tab: 'tenancies', unitId })}
-              onAddDocument={(ownerType, ownerId) => setDocumentModal({
-                ownerType,
-                ownerId,
-                propertyId: selectedProperty.id,
-              })}
+              onAdd={(unitId) => openTransactionEditor({ propertyId: selectedProperty.id, unitId })}
+              onAddUnit={() => {
+                if (!blockNewWrite('Einheit anlegen')) setUnitModal({ propertyId: selectedProperty.id });
+              }}
+              onEditUnit={(unitId) => {
+                if (!blockNewWrite('Einheit bearbeiten')) setUnitModal({ propertyId: selectedProperty.id, unitId });
+              }}
+              onAddTenancy={(unitId) => {
+                if (!blockNewWrite('Mietverhältnis anlegen')) openTenantRecord({ tab: 'tenancies', unitId });
+              }}
+              onAddDocument={(ownerType, ownerId) => {
+                if (blockNewWrite('Dokument anhängen')) return;
+                setDocumentModal({
+                  ownerType,
+                  ownerId,
+                  propertyId: selectedProperty.id,
+                });
+              }}
               onOpenDocument={setDocumentDetail}
               onEndTenancy={endTenancy}
-              onOpenTransaction={setTransactionDetail}
+              onOpenTransaction={openTransactionPreview}
               onSaveContact={saveContact}
               allProperties={displayProperties}
               onOpenContactArea={(contactId) => openTenantRecord({
@@ -1133,6 +1448,11 @@ function App() {
                 tenancyId,
                 origin: { propertyId: selectedProperty.id, label: selectedProperty.name },
               })}
+              writeBlocked={Boolean(editorWindow)}
+              onWriteBlocked={() => blockCompetingWrite('Kontakt bearbeiten')}
+              onWriterStateChange={updateExternalWriter}
+              sessionState={propertySessions[selectedProperty.id]}
+              onSessionStateChange={updatePropertySession}
             />
           )}
           {activeView === 'tenants' && (
@@ -1164,6 +1484,9 @@ function App() {
                 onBackToOrigin={tenantTarget?.origin?.propertyId
                   ? () => openProperty(tenantTarget.origin.propertyId)
                   : null}
+                writeBlocked={Boolean(editorWindow)}
+                onWriteBlocked={() => blockCompetingWrite('Mieterbereich bearbeiten')}
+                onWriterStateChange={updateExternalWriter}
               />
             </>
           )}
@@ -1178,8 +1501,8 @@ function App() {
                 tenancyUnits={tenancyUnits}
                 tenancyParties={tenancyParties}
                 contacts={contacts}
-                onAdd={() => properties.length && setTransactionModal({})}
-                onOpenTransaction={setTransactionDetail}
+                onAdd={() => properties.length && openTransactionEditor({})}
+                onOpenTransaction={openTransactionPreview}
               />
               <RecurringRulesPanel
                 rules={recurringRules}
@@ -1190,6 +1513,9 @@ function App() {
                   throughDate: new Date().toISOString().slice(0, 10),
                   tenancyId: null,
                 })}
+                writeBlocked={Boolean(editorWindow)}
+                onWriteBlocked={() => blockCompetingWrite('Wiederkehrende Sollstellung bearbeiten')}
+                onWriterStateChange={updateExternalWriter}
               />
             </>
           )}
@@ -1200,7 +1526,9 @@ function App() {
               onOpen={setDocumentDetail}
               onAdd={() => {
                 const propertyId = selectedPropertyId || displayProperties[0]?.id;
-                if (propertyId) setDocumentModal({ ownerType: 'property', ownerId: propertyId, propertyId });
+                if (propertyId && !blockNewWrite('Dokument anhängen')) {
+                  setDocumentModal({ ownerType: 'property', ownerId: propertyId, propertyId });
+                }
               }}
             />
           )}
@@ -1214,6 +1542,9 @@ function App() {
               onAdd={addCategory}
               tutorialProgress={tutorialProgress}
               onOpenTutorial={openTutorial}
+              writeBlocked={Boolean(editorWindow)}
+              onWriteBlocked={() => blockCompetingWrite('Kategorie anlegen')}
+              onWriterStateChange={updateExternalWriter}
             />
           )}
         </div>
@@ -1233,21 +1564,6 @@ function App() {
         onKeep={detachTutorialData}
         onCleanup={cleanupTutorialData}
       />
-
-      {transactionModal && properties.length > 0 && (
-        <TransactionModal
-          properties={displayProperties}
-          categories={categories}
-          units={units}
-          tenancies={tenancies}
-          tenancyUnits={tenancyUnits}
-          contacts={contacts}
-          presetPropertyId={transactionModal.propertyId}
-          presetUnitId={transactionModal.unitId}
-          onClose={() => setTransactionModal(null)}
-          onSubmit={addTransaction}
-        />
-      )}
 
       {propertyModal && (
         <PropertyModal
@@ -1283,36 +1599,93 @@ function App() {
         />
       )}
 
-      {transactionDetail && (
-        <TransactionDetailModal
-          transaction={transactionDetail}
-          property={displayProperties.find(
-            (property) => property.id === transactionDetail.propertyId,
-          )}
-          unit={units.find((unit) => unit.id === transactionDetail.unitId)}
-          units={units}
-          tenancies={tenancies}
-          contacts={contacts}
-          category={categories.find(
-            (category) => category.id === transactionDetail.categoryId,
-          )}
-          parentCategory={categories.find(
-            (category) =>
-              category.id ===
-              categories.find((item) => item.id === transactionDetail.categoryId)?.parentId,
-          )}
-          onAddDocument={() => {
-            setDocumentModal({
-              ownerType: 'transaction',
-              ownerId: transactionDetail.id,
-              propertyId: transactionDetail.propertyId,
-            });
-            setTransactionDetail(null);
-          }}
-          onDelete={() => deleteTransaction(transactionDetail.id)}
-          onClose={() => setTransactionDetail(null)}
-        />
+      {editorWindow && (
+        <WorkspaceWindow
+          {...editorWindow}
+          active={workspace.activeWindowId === editorWindow.id}
+          onActivate={(windowId) => setWorkspace((current) => ({ ...current, activeWindowId: windowId }))}
+          onMinimize={minimizeWorkspaceAndFocusTask}
+          onRequestClose={requestWorkspaceClose}
+          onRectChange={(rect) => setWorkspace((current) => setWorkspacePlacement(current, editorWindow.id, { rect }))}
+          onDockChange={(dock) => setWorkspace((current) => setWorkspacePlacement(current, editorWindow.id, { dock }))}
+          onSizeChange={(size) => setWorkspace((current) => setWorkspacePlacement(current, editorWindow.id, { size }))}
+          discardPrompt={discardWindowId === editorWindow.id ? (
+            <div className="workspace-discard-prompt">
+              <div>
+                <strong>Ungespeicherten Entwurf verwerfen?</strong>
+                <span>Alle Eingaben und der ausgewählte Beleg gehen verloren.</span>
+              </div>
+              <div>
+                <button type="button" className="button button--ghost" onClick={() => setDiscardWindowId('')}>Weiter bearbeiten</button>
+                <button type="button" className="button button--danger" onClick={discardWorkspaceDraft}>Entwurf verwerfen</button>
+              </div>
+            </div>
+          ) : null}
+        >
+          <TransactionEditorWindow
+            draft={editorWindow.payload?.draft}
+            file={editorWindow.payload?.file}
+            manualAmounts={editorWindow.payload?.manualAmounts}
+            status={editorWindow.payload?.status}
+            error={editorWindow.payload?.error}
+            dirty={editorWindow.dirty}
+            properties={displayProperties}
+            categories={categories}
+            units={units}
+            tenancies={tenancies}
+            tenancyUnits={tenancyUnits}
+            contacts={contacts}
+            onDraftChange={(draft) => setWorkspace((current) => updateWorkspacePayload(current, editorWindow.id, { draft }))}
+            onFileChange={(file) => setWorkspace((current) => updateWorkspacePayload(current, editorWindow.id, { file }))}
+            onManualAmountsChange={(manualAmounts) => setWorkspace((current) => updateWorkspacePayload(current, editorWindow.id, { manualAmounts }))}
+            onStatusChange={(status) => setWorkspace((current) => updateWorkspacePayload(current, editorWindow.id, { status }))}
+            onErrorChange={(error) => setWorkspace((current) => updateWorkspacePayload(current, editorWindow.id, { error }))}
+            onDirtyChange={(dirty) => setWorkspace((current) => setWorkspaceDirty(current, editorWindow.id, dirty))}
+            onSave={saveWorkspaceTransaction}
+            onRequestClose={() => requestWorkspaceClose(editorWindow.id)}
+          />
+        </WorkspaceWindow>
       )}
+
+      {previewWindow && transactionDetail && (
+        <WorkspaceWindow
+          {...previewWindow}
+          active={workspace.activeWindowId === previewWindow.id}
+          onActivate={(windowId) => setWorkspace((current) => ({ ...current, activeWindowId: windowId }))}
+          onMinimize={minimizeWorkspaceAndFocusTask}
+          onRequestClose={requestWorkspaceClose}
+          onRectChange={(rect) => setWorkspace((current) => setWorkspacePlacement(current, previewWindow.id, { rect }))}
+          onDockChange={(dock) => setWorkspace((current) => setWorkspacePlacement(current, previewWindow.id, { dock }))}
+          onSizeChange={(size) => setWorkspace((current) => setWorkspacePlacement(current, previewWindow.id, { size }))}
+        >
+          <TransactionPreviewWindow
+            transaction={transactionDetail}
+            property={displayProperties.find((property) => property.id === transactionDetail.propertyId)}
+            unit={units.find((unit) => unit.id === transactionDetail.unitId)}
+            units={units}
+            tenancies={tenancies}
+            contacts={contacts}
+            category={categories.find((category) => category.id === transactionDetail.categoryId)}
+            parentCategory={categories.find((category) => category.id === categories.find((item) => item.id === transactionDetail.categoryId)?.parentId)}
+            readOnly={Boolean(editorWindow)}
+            deleteArmed={previewDeleteArmed}
+            onDeleteArmedChange={setPreviewDeleteArmed}
+            onAddDocument={() => {
+              if (blockNewWrite('Dokument anhängen')) return;
+              setDocumentModal({
+                ownerType: 'transaction',
+                ownerId: transactionDetail.id,
+                propertyId: transactionDetail.propertyId,
+              });
+              requestWorkspaceClose(previewWindow.id);
+            }}
+            onDelete={() => deleteTransaction(transactionDetail.id)}
+            onRequestClose={() => requestWorkspaceClose(previewWindow.id)}
+          />
+        </WorkspaceWindow>
+      )}
+
+      <WorkspaceTaskbar windows={workspace.windows} onRestore={focusWorkspaceWindow} />
 
       {toast && <div className="toast">{toast}</div>}
     </div>
@@ -1651,6 +2024,7 @@ function PropertyDetail({
   units,
   contacts,
   tenancies,
+  tenancyParties,
   tenancyUnits,
   documents,
   onBack,
@@ -1666,6 +2040,11 @@ function PropertyDetail({
   allProperties,
   onOpenContactArea,
   onOpenTenancy,
+  writeBlocked,
+  onWriteBlocked,
+  onWriterStateChange,
+  sessionState,
+  onSessionStateChange,
 }) {
   const propertyUnitIds = units.map((unit) => unit.id);
   const propertyTenancies = tenancies.filter((tenancy) =>
@@ -1676,16 +2055,26 @@ function PropertyDetail({
   const availableYears = [
     ...new Set(propertyTransactions.map((transaction) => getYear(transaction.date))),
   ].sort((a, b) => b - a);
-  const [selectedYear, setSelectedYear] = useState(availableYears[0] || DEMO_YEAR);
-  const [kindFilter, setKindFilter] = useState('all');
-  const [categoryFilter, setCategoryFilter] = useState('all');
-  const [unitFilter, setUnitFilter] = useState('all');
-  const [tenancyFilter, setTenancyFilter] = useState('all');
-  const [allocationFilter, setAllocationFilter] = useState('all');
-  const [selectedContext, setSelectedContext] = useState({ type: 'property', id: property.id });
-  const [treeOpen, setTreeOpen] = useState(true);
-  const [expandedUnits, setExpandedUnits] = useState(() => new Set(units.map((unit) => unit.id)));
+  const restoredSession = normalizePropertySessionState(sessionState, {
+    propertyId: property.id,
+    years: availableYears,
+    units,
+    tenancies: propertyTenancies,
+    categories,
+    fallbackYear: DEMO_YEAR,
+  });
+  const [selectedYear, setSelectedYear] = useState(restoredSession.selectedYear);
+  const [kindFilter, setKindFilter] = useState(restoredSession.kindFilter);
+  const [categoryFilter, setCategoryFilter] = useState(restoredSession.categoryFilter);
+  const [unitFilter, setUnitFilter] = useState(restoredSession.unitFilter);
+  const [tenancyFilter, setTenancyFilter] = useState(restoredSession.tenancyFilter);
+  const [allocationFilter, setAllocationFilter] = useState(restoredSession.allocationFilter);
+  const [transactionSearch, setTransactionSearch] = useState(restoredSession.transactionSearch);
+  const [selectedContext, setSelectedContext] = useState(restoredSession.selectedContext);
+  const [treeOpen, setTreeOpen] = useState(restoredSession.treeOpen);
+  const [expandedUnits, setExpandedUnits] = useState(() => new Set(restoredSession.expandedUnitIds));
   const [contactDirty, setContactDirty] = useState(false);
+  const [activePropertyTab, setActivePropertyTab] = useState(restoredSession.activePropertyTab);
 
   const selectContext = (nextContext) => {
     if (contactDirty && (nextContext.type !== selectedContext.type || nextContext.id !== selectedContext.id)) {
@@ -1696,17 +2085,33 @@ function PropertyDetail({
   };
 
   useEffect(() => {
-    setSelectedYear(availableYears[0] || DEMO_YEAR);
-    setKindFilter('all');
-    setCategoryFilter('all');
-    setUnitFilter('all');
-    setTenancyFilter('all');
-    setAllocationFilter('all');
-    setSelectedContext({ type: 'property', id: property.id });
-    setContactDirty(false);
-    setTreeOpen(true);
-    setExpandedUnits(new Set(units.map((unit) => unit.id)));
-  }, [property.id]);
+    onSessionStateChange?.(property.id, {
+      activePropertyTab,
+      selectedYear,
+      kindFilter,
+      categoryFilter,
+      unitFilter,
+      tenancyFilter,
+      allocationFilter,
+      transactionSearch,
+      selectedContext,
+      treeOpen,
+      expandedUnitIds: [...expandedUnits],
+    });
+  }, [
+    activePropertyTab,
+    allocationFilter,
+    categoryFilter,
+    expandedUnits,
+    kindFilter,
+    property.id,
+    selectedContext,
+    selectedYear,
+    tenancyFilter,
+    transactionSearch,
+    treeOpen,
+    unitFilter,
+  ]);
 
   const rows = propertyTransactions
     .filter((transaction) => getYear(transaction.date) === Number(selectedYear))
@@ -1714,9 +2119,7 @@ function PropertyDetail({
   const visibleRows = rows
     .filter((transaction) => kindFilter === 'all' || transaction.kind === kindFilter)
     .filter((transaction) => {
-      if (categoryFilter === 'all') return true;
-      const category = categories.find((item) => item.id === transaction.categoryId);
-      return transaction.categoryId === categoryFilter || category?.parentId === categoryFilter;
+      return categoryMatchesFilter(transaction.categoryId, categoryFilter, categories);
     })
     .filter((transaction) => transactionMatchesUnit(transaction, unitFilter))
     .filter((transaction) => transactionMatchesTenancy(transaction, tenancyFilter))
@@ -1725,16 +2128,37 @@ function PropertyDetail({
       return allocationFilter === 'allocatable'
         ? transaction.allocatable === true
         : transaction.kind !== 'expense' || transaction.allocatable !== true;
+    })
+    .filter((transaction) => {
+      const relatedUnit = units.find((item) => item.id === transaction.unitId);
+      const relatedTenancy = propertyTenancies.find((item) => item.id === transaction.tenancyId);
+      const relatedContact = contacts.find((item) => item.id === relatedTenancy?.primaryContactId);
+      return matchesGermanSearch(transactionSearch, [
+        transaction.description,
+        transaction.receiptName,
+        transaction.date,
+        formatDate(transaction.date),
+        transaction.amount,
+        moneyExact.format(transaction.amount),
+        categoryPathNames(transaction.categoryId, categories),
+        relatedUnit?.name,
+        relatedContact?.name,
+      ]);
     });
-  const usedCategories = categories.filter((category) =>
-    rows.some(
-      (transaction) =>
-        transaction.categoryId === category.id ||
-        categories.find((item) => item.id === transaction.categoryId)?.parentId === category.id,
-    ),
-  );
   const income = sum(rows, 'income');
   const expenses = sum(rows, 'expense');
+
+  const showAllContextMovements = (context) => {
+    const filters = propertyContextToFinanceFilters(context, {
+      propertyId: property.id,
+      units,
+      tenancies: propertyTenancies,
+      tenancyUnits,
+    });
+    setUnitFilter(filters.unitFilter);
+    setTenancyFilter(filters.tenancyFilter);
+    setActivePropertyTab('finances');
+  };
 
   return (
     <>
@@ -1743,34 +2167,43 @@ function PropertyDetail({
         Zurück zu Immobilien
       </button>
 
-      <section className="property-hero card">
-        <div className="property-hero__visual" style={{ '--accent': property.accent }}>
-          <span>{property.initials}</span>
+      <section className="card property-compact-header">
+        <div className="property-compact-header__identity">
+          <span className="type-label">{property.objectType || property.type}</span>
+          <h2>{property.name}</h2>
+          <p>{propertyAddressLine(property)}</p>
         </div>
-        <div className="property-hero__content">
-          <div className="property-hero__heading">
-            <div>
-              <span className="type-label">{property.type}</span>
-              <h2>{property.name}</h2>
-              <p>{propertyAddressLine(property)}</p>
-            </div>
-            <button type="button" className="button button--primary" onClick={() => onAdd()}>
-              <Icon name="plus" size={18} />
-              Buchung erfassen
-            </button>
-          </div>
-          <p className="property-description">{property.description}</p>
-          <div className="hero-facts">
-            <span><strong>{property.units}</strong> Einheiten</span>
-            <span><strong>{property.occupiedUnits}</strong> vermietet</span>
-            <span><strong>{number.format(property.area)} m²</strong> Fläche</span>
-            <span><strong>{formatPlanValue(property.planColdRent, property.planConfiguredCold, property.planTotalUnits)}</strong> Plan-Kaltmiete</span>
-            <span><strong>{formatPlanValue(property.planUtilityAdvance, property.planConfiguredUtility, property.planTotalUnits)}</strong> Plan-Betriebskosten</span>
-            <span><strong>{formatPlanValue(property.planWarmRent, property.planConfiguredWarm, property.planTotalUnits)}</strong> Plan-Warmmiete</span>
-            <span><strong>{money.format(property.activeWarmRent)}</strong> Aktuelle Vertrags-Warmmiete</span>
-          </div>
+        <button type="button" className="button button--primary" onClick={() => onAdd()}>
+          <Icon name="plus" size={18} />
+          Buchung erfassen
+        </button>
+        <div className="property-compact-header__facts" aria-label="Kennzahlen der Immobilie">
+          <span><small>Einheiten</small><strong>{property.units}</strong></span>
+          <span><small>Vermietet</small><strong>{property.occupiedUnits} / {property.units}</strong></span>
+          <span><small>Kaltmiete · Plan / Vertrag</small><strong>{formatPlanValue(property.planColdRent, property.planConfiguredCold, property.planTotalUnits)} / {moneyExact.format(property.activeColdRent)}</strong></span>
+          <span><small>Betriebskosten · Plan / Vertrag</small><strong>{formatPlanValue(property.planUtilityAdvance, property.planConfiguredUtility, property.planTotalUnits)} / {moneyExact.format(property.activeUtilityAdvance)}</strong></span>
+          <span><small>Warmmiete · Plan / Vertrag</small><strong>{formatPlanValue(property.planWarmRent, property.planConfiguredWarm, property.planTotalUnits)} / {moneyExact.format(property.activeWarmRent)}</strong></span>
         </div>
       </section>
+
+      <PropertyTabs
+        activeId={activePropertyTab}
+        onChange={setActivePropertyTab}
+        tabs={[
+          { id: 'overview', label: 'Übersicht', panelId: 'property-panel-overview' },
+          { id: 'records', label: 'Objektakte', panelId: 'property-panel-records', badge: documents.filter((document) => document.propertyId === property.id).length },
+          { id: 'finances', label: 'Finanzen & Belege', panelId: 'property-panel-finances', badge: propertyTransactions.length },
+        ]}
+      />
+
+      <section
+        id="property-panel-overview"
+        className="property-tab-panel"
+        role="tabpanel"
+        aria-labelledby="property-tab-overview"
+        tabIndex={0}
+        hidden={activePropertyTab !== 'overview'}
+      >
 
       <section className="metric-grid metric-grid--three">
         <MetricCard
@@ -1780,7 +2213,10 @@ function PropertyDetail({
           tone="green"
           indicator="Ist"
           active={kindFilter === 'income'}
-          onClick={() => setKindFilter(kindFilter === 'income' ? 'all' : 'income')}
+          onClick={() => {
+            setKindFilter(kindFilter === 'income' ? 'all' : 'income');
+            setActivePropertyTab('finances');
+          }}
         />
         <MetricCard
           label="Ausgaben"
@@ -1789,7 +2225,10 @@ function PropertyDetail({
           tone="orange"
           indicator={rows.filter((row) => row.receiptName).length + ' Belege'}
           active={kindFilter === 'expense'}
-          onClick={() => setKindFilter(kindFilter === 'expense' ? 'all' : 'expense')}
+          onClick={() => {
+            setKindFilter(kindFilter === 'expense' ? 'all' : 'expense');
+            setActivePropertyTab('finances');
+          }}
         />
         <MetricCard
           label="Objektergebnis"
@@ -1799,6 +2238,36 @@ function PropertyDetail({
           indicator={income ? Math.round(((income - expenses) / income) * 100) + ' %' : '–'}
         />
       </section>
+
+      <section className="detail-grid">
+        <div className="card chart-card">
+          <CardHeader title="Jahresverlauf" subtitle={'Objektbezogene Buchungen ' + selectedYear} action={<Legend />} />
+          <MonthlyChart transactions={rows} />
+        </div>
+        <div className="card facts-card">
+          <CardHeader title="Objektfakten & Hinweise" subtitle="Ergänzende Angaben ohne Finanzdopplungen" />
+          <dl>
+            <div><dt>Baujahr</dt><dd>{property.built}</dd></div>
+            <div><dt>Gesamtfläche</dt><dd>{number.format(property.area)} m²</dd></div>
+            <div><dt>Land</dt><dd>{property.country || 'Deutschland'}</dd></div>
+            <div><dt>Planwerte gepflegt</dt><dd>{planCompletenessLabel(property.planConfiguredWarm, property.planTotalUnits)}</dd></div>
+            <div><dt>Hinweis</dt><dd>{property.description || 'Keine offenen Objekthinweise hinterlegt.'}</dd></div>
+            {property.legacyTargetColdRentTotal !== null && property.legacyTargetColdRentTotal !== undefined && (
+              <div><dt>Historischer Objekt-Sollwert</dt><dd>{money.format(property.legacyTargetColdRentTotal)} · nicht operativ</dd></div>
+            )}
+          </dl>
+        </div>
+      </section>
+      </section>
+
+      <section
+        id="property-panel-records"
+        className="property-tab-panel"
+        role="tabpanel"
+        aria-labelledby="property-tab-records"
+        tabIndex={0}
+        hidden={activePropertyTab !== 'records'}
+      >
 
       <section className="card object-workspace">
         <CardHeader
@@ -1814,6 +2283,7 @@ function PropertyDetail({
             property={property}
             units={units}
             tenancies={propertyTenancies}
+            tenancyParties={tenancyParties}
             tenancyUnits={tenancyUnits}
             contacts={contacts}
             selectedContext={selectedContext}
@@ -1833,6 +2303,7 @@ function PropertyDetail({
             property={property}
             units={units}
             tenancies={propertyTenancies}
+            tenancyParties={tenancyParties}
             tenancyUnits={tenancyUnits}
             contacts={contacts}
             documents={documents}
@@ -1846,6 +2317,7 @@ function PropertyDetail({
             onEndTenancy={onEndTenancy}
             onAddTransaction={onAdd}
             onOpenTransaction={onOpenTransaction}
+            onShowAllTransactions={showAllContextMovements}
             allProperties={allProperties}
             onSaveContact={onSaveContact}
             contactDirty={contactDirty}
@@ -1853,31 +2325,22 @@ function PropertyDetail({
             onSelectContact={(contactId, tenancyId) => selectContext({ type: 'contact', id: contactId, tenancyId })}
             onOpenContactArea={onOpenContactArea}
             onOpenTenancy={onOpenTenancy}
+            writeBlocked={writeBlocked}
+            onWriteBlocked={onWriteBlocked}
+            onWriterStateChange={onWriterStateChange}
           />
         </div>
       </section>
-
-      <section className="detail-grid">
-        <div className="card chart-card">
-          <CardHeader title="Jahresverlauf" subtitle={'Objektbezogene Buchungen ' + selectedYear} action={<Legend />} />
-          <MonthlyChart transactions={rows} />
-        </div>
-        <div className="card facts-card">
-          <CardHeader title="Objektdaten" subtitle="Stammdaten der Demo" />
-          <dl>
-            <div><dt>Nutzungsart</dt><dd>{property.type}</dd></div>
-            <div><dt>Baujahr</dt><dd>{property.built}</dd></div>
-            <div><dt>Gesamtfläche</dt><dd>{number.format(property.area)} m²</dd></div>
-            <div><dt>Vermietungsstand</dt><dd>{property.occupiedUnits} / {property.units}</dd></div>
-            <div><dt>Plan-Kaltmiete p.a.</dt><dd>{formatPlanValue(property.planColdRent, property.planConfiguredCold, property.planTotalUnits, 12)}</dd></div>
-            <div><dt>Plan-Betriebskosten p.a.</dt><dd>{formatPlanValue(property.planUtilityAdvance, property.planConfiguredUtility, property.planTotalUnits, 12)}</dd></div>
-            <div><dt>Aktuelle Vertrags-Warmmiete</dt><dd>{money.format(property.activeWarmRent)}</dd></div>
-            {property.legacyTargetColdRentTotal !== null && property.legacyTargetColdRentTotal !== undefined && (
-              <div><dt>Historischer Objekt-Sollwert</dt><dd>{money.format(property.legacyTargetColdRentTotal)} · nicht operativ</dd></div>
-            )}
-          </dl>
-        </div>
       </section>
+
+      <section
+        id="property-panel-finances"
+        className="property-tab-panel"
+        role="tabpanel"
+        aria-labelledby="property-tab-finances"
+        tabIndex={0}
+        hidden={activePropertyTab !== 'finances'}
+      >
 
       <section className="card object-ledger">
         <CardHeader
@@ -1902,6 +2365,16 @@ function PropertyDetail({
           }
         />
         <div className="object-ledger__filters">
+          <label className="search-field object-ledger__search">
+            <Icon name="search" size={16} />
+            <span className="tenant-area__accessible-label">Objektbuchungen durchsuchen</span>
+            <input
+              type="search"
+              value={transactionSearch}
+              onChange={(event) => setTransactionSearch(event.target.value)}
+              placeholder="Beschreibung, Kategorie, Beleg …"
+            />
+          </label>
           <div className="filter-pills" aria-label="Buchungsart">
             <button
               type="button"
@@ -1933,21 +2406,7 @@ function PropertyDetail({
               onChange={(event) => setCategoryFilter(event.target.value)}
             >
               <option value="all">Alle Kategorien</option>
-              {usedCategories
-                .filter((category) => !category.parentId)
-                .map((category) => (
-                  <option key={category.id} value={category.id}>{category.name}</option>
-                ))}
-              {usedCategories
-                .filter((category) => category.parentId)
-                .map((category) => {
-                  const parent = categories.find((item) => item.id === category.parentId);
-                  return (
-                    <option key={category.id} value={category.id}>
-                      {(parent ? parent.name + ' › ' : '') + category.name}
-                    </option>
-                  );
-                })}
+              <CategoryFilterOptions categories={categories} />
             </select>
           </label>
           <label className="compact-select compact-select--category">
@@ -2000,6 +2459,7 @@ function PropertyDetail({
           onOpenTransaction={onOpenTransaction}
         />
       </section>
+      </section>
     </>
   );
 }
@@ -2008,6 +2468,7 @@ function ObjectTree({
   property,
   units,
   tenancies,
+  tenancyParties,
   tenancyUnits,
   contacts,
   selectedContext,
@@ -2080,7 +2541,7 @@ function ObjectTree({
                             <span><strong>{tenancyStateLabel(tenancy)}</strong><small>{primary?.name || 'Ohne Hauptkontakt'}</small></span>
                           </button>
                           <div className="tree-branch tree-branch--contacts">
-                            {(tenancy.contactIds || []).map((contactId) => {
+                            {tenancyContactIdsFromRelations(tenancy, tenancyParties).map((contactId) => {
                               const contact = contacts.find((item) => item.id === contactId);
                               if (!contact) return null;
                               return (
@@ -2116,6 +2577,7 @@ function ObjectContextPanel({
   property,
   units,
   tenancies,
+  tenancyParties,
   tenancyUnits,
   contacts,
   documents,
@@ -2129,6 +2591,7 @@ function ObjectContextPanel({
   onEndTenancy,
   onAddTransaction,
   onOpenTransaction,
+  onShowAllTransactions,
   allProperties,
   onSaveContact,
   contactDirty,
@@ -2136,6 +2599,9 @@ function ObjectContextPanel({
   onSelectContact,
   onOpenContactArea,
   onOpenTenancy,
+  writeBlocked,
+  onWriteBlocked,
+  onWriterStateChange,
 }) {
   const unit = context.type === 'unit'
     ? units.find((item) => item.id === context.id)
@@ -2149,7 +2615,7 @@ function ObjectContextPanel({
     ? tenancies.find((item) => item.id === context.id)
     : context.type === 'contact'
       ? tenancies.find((item) => item.id === context.tenancyId)
-        || tenancies.find((item) => (item.contactIds || []).includes(context.id))
+        || tenancies.find((item) => tenancyContactIdsFromRelations(item, tenancyParties).includes(context.id))
       : context.type === 'unit'
         ? activeTenancyForUnit(tenancies, context.id, undefined, tenancyUnits)
         : null;
@@ -2166,6 +2632,10 @@ function ObjectContextPanel({
     if (context.type === 'contact') return tenancy && transactionMatchesTenancy(transaction, tenancy.id);
     return false;
   });
+  const movementContext = context.type === 'contact'
+    ? { ...context, tenancyId: tenancy?.id || context.tenancyId }
+    : context;
+  const recentContextTransactions = topPropertyContextMovements(transactions, movementContext, 5);
   const title = context.type === 'property'
     ? 'Objektakte ' + property.shortName
     : context.type === 'unit'
@@ -2213,10 +2683,7 @@ function ObjectContextPanel({
           <ContextFact label="Aktiv vermietet" value={String(tenancies.filter((item) => isTenancyActive(item)).length)} />
           <ContextFact label="Dokumente gesamt" value={String(contextDocuments.length)} />
           <ContextFact label="Buchungen" value={String(contextTransactions.length)} />
-          <ContextFact label="Plan-Kaltmiete" value={formatPlanValue(propertyPlan.coldRent, propertyPlan.configuredCold, propertyPlan.totalUnits)} />
-          <ContextFact label="Plan-Betriebskosten" value={formatPlanValue(propertyPlan.utilityAdvance, propertyPlan.configuredUtility, propertyPlan.totalUnits)} />
-          <ContextFact label="Plan-Warmmiete" value={formatPlanValue(propertyPlan.warmRent, propertyPlan.configuredWarm, propertyPlan.totalUnits)} />
-          <ContextFact label="Plan-Vollständigkeit" value={planCompletenessLabel(propertyPlan.configuredWarm, propertyPlan.totalUnits)} />
+          <ContextFact label="Plan-Datenpflege" value={planCompletenessLabel(propertyPlan.configuredWarm, propertyPlan.totalUnits)} />
         </div>
       )}
       {context.type === 'unit' && unit && (
@@ -2240,7 +2707,7 @@ function ObjectContextPanel({
             <ContextFact label="Kaution" value={moneyExact.format(tenancy.deposit)} />
           </div>
           <div className="tenancy-parties">
-            {(tenancy.contactIds || []).map((contactId) => {
+            {tenancyContactIdsFromRelations(tenancy, tenancyParties).map((contactId) => {
               const party = contacts.find((item) => item.id === contactId);
               return party ? (
                 <button type="button" key={party.id} onClick={() => onSelectContact(party.id, tenancy.id)} aria-label={`${party.name} rechts in der Kontaktakte anzeigen`}>
@@ -2263,6 +2730,9 @@ function ObjectContextPanel({
             onSave={onSaveContact}
             dirty={contactDirty}
             onDirtyChange={onContactDirtyChange}
+            writeBlocked={writeBlocked}
+            onWriteBlocked={onWriteBlocked}
+            onWriterStateChange={onWriterStateChange}
           />
         </div>
       )}
@@ -2272,9 +2742,14 @@ function ObjectContextPanel({
         <DocumentList documents={contextDocuments} onOpen={onOpenDocument} />
       </div>
       <div className="context-section">
-        <div className="context-section__heading"><div><h4>Zugeordnete Bewegungen</h4><p>Kostenanteile und Einnahmen dieses Bereichs</p></div><span>{contextTransactions.length}</span></div>
+        <div className="context-section__heading">
+          <div><h4>Zugeordnete Bewegungen</h4><p>{recentContextTransactions.length} von {contextTransactions.length} · neueste zuerst</p></div>
+          <button type="button" className="button button--ghost button--small" onClick={() => onShowAllTransactions?.(movementContext)}>
+            Alle Bewegungen ansehen
+          </button>
+        </div>
         <TransactionsTable
-          transactions={contextTransactions.slice(0, 5)}
+          transactions={recentContextTransactions}
           properties={[property]}
           categories={categories}
           units={units}
@@ -2656,16 +3131,47 @@ function ReportsPage({ properties, transactions }) {
   );
 }
 
-function CategoriesPage({ categories, transactions, onAdd, tutorialProgress, onOpenTutorial }) {
+function CategoriesPage({
+  categories,
+  transactions,
+  onAdd,
+  tutorialProgress,
+  onOpenTutorial,
+  writeBlocked = false,
+  onWriteBlocked,
+  onWriterStateChange,
+}) {
   const [name, setName] = useState('');
   const [kind, setKind] = useState('expense');
   const [parentId, setParentId] = useState('');
+  const categoryDraftDirty = Boolean(name.trim() || kind !== 'expense' || parentId);
+
+  useEffect(() => {
+    onWriterStateChange?.({
+      id: 'category-create',
+      label: 'Kategorie anlegen',
+      focusId: 'category-name-input',
+      active: categoryDraftDirty,
+      dirty: categoryDraftDirty,
+    });
+  }, [name, kind, parentId]);
+
+  useEffect(() => () => {
+    onWriterStateChange?.({ id: 'category-create', active: false });
+  }, []);
 
   const submit = (event) => {
     event.preventDefault();
+    if (writeBlocked) {
+      onWriteBlocked?.();
+      return;
+    }
     if (!name.trim()) return;
-    onAdd({ name: name.trim(), kind, parentId: parentId || null });
+    const saved = onAdd({ name: name.trim(), kind, parentId: parentId || null });
+    if (saved === false) return;
     setName('');
+    setKind('expense');
+    setParentId('');
   };
 
   const changeKind = (value) => {
@@ -2755,25 +3261,30 @@ function CategoriesPage({ categories, transactions, onAdd, tutorialProgress, onO
             subtitle="Haupt- oder Unterkategorie"
           />
           <form onSubmit={submit}>
+            {writeBlocked && (
+              <button type="button" className="info-banner" onClick={onWriteBlocked}>Buchungsentwurf geöffnet · Entwurf anzeigen</button>
+            )}
             <label>
               <span>Bezeichnung</span>
               <input
+                id="category-name-input"
                 value={name}
                 onChange={(event) => setName(event.target.value)}
                 placeholder="z. B. Schornsteinfeger"
                 required
+                disabled={writeBlocked}
               />
             </label>
             <label>
               <span>Art</span>
-              <select value={kind} onChange={(event) => changeKind(event.target.value)}>
+              <select value={kind} onChange={(event) => changeKind(event.target.value)} disabled={writeBlocked}>
                 <option value="expense">Ausgabe</option>
                 <option value="income">Einnahme</option>
               </select>
             </label>
             <label>
               <span>Übergeordnete Kategorie</span>
-              <select value={parentId} onChange={(event) => setParentId(event.target.value)}>
+              <select value={parentId} onChange={(event) => setParentId(event.target.value)} disabled={writeBlocked}>
                 <option value="">Keine – neue Hauptkategorie</option>
                 {parentCategories.map((category) => (
                   <option key={category.id} value={category.id}>{category.name}</option>
@@ -2783,7 +3294,7 @@ function CategoriesPage({ categories, transactions, onAdd, tutorialProgress, onO
             <p className="form-help">
               Beispiel: Versicherungen als Hauptkategorie und Gebäudeversicherung darunter.
             </p>
-            <button type="submit" className="button button--primary button--full">
+            <button type="submit" className="button button--primary button--full" disabled={writeBlocked}>
               <Icon name="plus" size={18} />
               {parentId ? 'Unterkategorie hinzufügen' : 'Kategorie hinzufügen'}
             </button>
@@ -2909,163 +3420,6 @@ function DocumentDetailModal({ document, onClose }) {
   );
 }
 
-function TransactionDetailModal({
-  transaction,
-  property,
-  unit,
-  units,
-  tenancies,
-  contacts,
-  category,
-  parentCategory,
-  onAddDocument,
-  onDelete,
-  onClose,
-}) {
-  const [deleteArmed, setDeleteArmed] = useState(false);
-  const categoryName = parentCategory
-    ? parentCategory.name + ' › ' + category.name
-    : category?.name || 'Ohne Kategorie';
-  const isImage = transaction.receiptDataUrl?.startsWith('data:image');
-
-  return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section
-        className="modal receipt-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="receipt-title"
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <div className="modal__header">
-          <div>
-            <span className="section-kicker">
-              {transaction.kind === 'income' ? 'Einnahme' : 'Ausgabe'}
-            </span>
-            <h2 id="receipt-title">Buchungsdetails</h2>
-          </div>
-          <button
-            type="button"
-            className="icon-button"
-            aria-label="Dialog schließen"
-            onClick={onClose}
-          >
-            <Icon name="close" />
-          </button>
-        </div>
-
-        <div className="receipt-modal__body">
-          <div className={'receipt-amount receipt-amount--' + transaction.kind}>
-            <span>{transaction.description}</span>
-            <strong>
-              {transaction.kind === 'expense' ? '− ' : '+ '}
-              {moneyExact.format(transaction.amount)}
-            </strong>
-          </div>
-          <dl className="transaction-detail-list">
-            <div><dt>Immobilie</dt><dd>{property?.name || 'Unbekannt'}</dd></div>
-            <div><dt>Datum</dt><dd>{formatDate(transaction.date)}</dd></div>
-            <div><dt>Kategorie</dt><dd>{categoryName}</dd></div>
-            <div><dt>Buchungsart</dt><dd>{transaction.kind === 'income' ? 'Einnahme' : 'Ausgabe'}</dd></div>
-            <div><dt>Geltungsbereich</dt><dd>{unit?.name || 'Gesamte Immobilie'}</dd></div>
-            {transaction.servicePeriodStart && transaction.servicePeriodEnd && <div><dt>Leistungszeitraum</dt><dd>{formatDate(transaction.servicePeriodStart)}–{formatDate(transaction.servicePeriodEnd)}</dd></div>}
-            {transaction.kind === 'expense' && <div><dt>Kostenstatus</dt><dd>{transaction.allocatable ? 'Umlagefähig markiert' : 'Eigentümerkosten'}</dd></div>}
-          </dl>
-
-          {transaction.kind === 'expense' && transaction.allocatable && (
-            <div className="detail-allocations">
-              <div className="receipt-preview__header"><div><span>Kostenverteilung</span><strong>{allocationLabel(transaction.allocationMode)}</strong></div><span className="receipt-status">Historischer Schnappschuss</span></div>
-              {transaction.allocations?.length ? transaction.allocations.map((allocation) => {
-                const allocationUnit = units.find((item) => item.id === allocation.unitId);
-                const allocationTenancy = tenancies.find((item) => item.id === allocation.tenancyId);
-                const primary = contacts.find((item) => item.id === allocationTenancy?.primaryContactId);
-                return <div className="detail-allocation-row" key={`${allocation.unitId}-${allocation.tenancyId || 'vacant'}-${allocation.servicePeriodStart || 'snapshot'}`}><span><strong>{allocationUnit?.name || 'Unbekannte Einheit'}</strong><small>{primary?.name || 'Leerstand / kein Mietverhältnis'}{allocation.servicePeriodStart && allocation.servicePeriodEnd ? ` · ${formatDate(allocation.servicePeriodStart)}–${formatDate(allocation.servicePeriodEnd)}` : ''}</small></span><strong>{moneyExact.format(allocation.amount)}</strong></div>;
-              }) : <p className="allocation-note">Manuelle oder externe Abrechnung – noch keine Anteile hinterlegt.</p>}
-            </div>
-          )}
-
-          {transaction.receiptName ? (
-            <div className="receipt-preview">
-              <div className="receipt-preview__header">
-                <div>
-                  <span>Beleg</span>
-                  <strong>{transaction.receiptName}</strong>
-                </div>
-                <span className="receipt-status">
-                  {transaction.receiptDataUrl ? 'Lokal gespeichert' : 'Demo-Beleg'}
-                </span>
-              </div>
-              {transaction.receiptDataUrl ? (
-                isImage ? (
-                  <img src={transaction.receiptDataUrl} alt="Belegvorschau" />
-                ) : (
-                  <iframe
-                    src={transaction.receiptDataUrl}
-                    title="Belegvorschau"
-                  />
-                )
-              ) : (
-                <div className="demo-invoice">
-                  <div className="demo-invoice__brand">
-                    <Icon name="file" size={25} />
-                    <div>
-                      <strong>RECHNUNG / BELEG</strong>
-                      <span>Vorführansicht ohne Originaldatei</span>
-                    </div>
-                  </div>
-                  <div className="demo-invoice__lines">
-                    <span />
-                    <span />
-                    <span />
-                  </div>
-                  <div className="demo-invoice__total">
-                    <span>Gesamtbetrag</span>
-                    <strong>{moneyExact.format(transaction.amount)}</strong>
-                  </div>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="no-document">
-              <Icon name="file" size={24} />
-              <div>
-                <strong>Kein Beleg hinterlegt</strong>
-                <span>Die Buchungsdetails sind trotzdem vollständig einsehbar.</span>
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="modal__footer receipt-modal__footer">
-          <p>Demo-Ansicht – keine revisionssichere Belegablage.</p>
-          <div>
-            <button
-              type="button"
-              className="button button--ghost"
-              onClick={() => deleteArmed ? onDelete() : setDeleteArmed(true)}
-            >
-              {deleteArmed ? 'Löschen bestätigen' : 'Buchung löschen'}
-            </button>
-            <button type="button" className="button button--ghost" onClick={onAddDocument}>Dokument anhängen</button>
-            {transaction.receiptDataUrl && (
-              <a
-                className="button button--ghost"
-                href={transaction.receiptDataUrl}
-                target="_blank"
-                rel="noreferrer"
-              >
-                Original öffnen
-              </a>
-            )}
-            <button type="button" className="button button--primary" onClick={onClose}>
-              Schließen
-            </button>
-          </div>
-        </div>
-      </section>
-    </div>
-  );
-}
 
 function PropertyModal({ propertyCount, onClose, onSubmit }) {
   const [form, setForm] = useState({
@@ -3285,369 +3639,5 @@ function PropertyModal({ propertyCount, onClose, onSubmit }) {
   );
 }
 
-function TransactionModal({
-  properties,
-  categories,
-  units,
-  tenancies,
-  tenancyUnits,
-  contacts,
-  presetPropertyId,
-  presetUnitId,
-  onClose,
-  onSubmit,
-}) {
-  const firstExpenseCategory = firstSelectableCategory(categories, 'expense') || categories[0];
-  const [form, setForm] = useState({
-    propertyId: presetPropertyId || properties[0].id,
-    unitId: presetUnitId || '',
-    date: new Date().toISOString().slice(0, 10),
-    kind: 'expense',
-    categoryId: firstExpenseCategory.id,
-    description: '',
-    amount: '',
-    servicePeriodStart: '',
-    servicePeriodEnd: '',
-    allocatable: firstExpenseCategory.allocatableDefault === true,
-    allocationMode: presetUnitId
-      ? 'direct'
-      : firstExpenseCategory.allocationModeDefault || 'area',
-  });
-  const [file, setFile] = useState(null);
-  const [fileNote, setFileNote] = useState('');
-  const [manualAmounts, setManualAmounts] = useState({});
-  const [allocationError, setAllocationError] = useState('');
-
-  const propertyUnits = units.filter((unit) => unit.propertyId === form.propertyId);
-  const selectedCategory = categories.find((category) => category.id === form.categoryId);
-  const hasServicePeriod = Boolean(form.servicePeriodStart && form.servicePeriodEnd);
-  const allocations = form.kind === 'expense' && form.allocatable
-    ? hasServicePeriod && form.allocationMode !== 'manual'
-      ? calculateServicePeriodAllocations({
-        amount: form.amount,
-        propertyId: form.propertyId,
-        unitId: form.unitId || null,
-        mode: form.allocationMode,
-        units,
-        tenancies,
-        tenancyUnits,
-        servicePeriodStart: form.servicePeriodStart,
-        servicePeriodEnd: form.servicePeriodEnd,
-      })
-      : calculateAllocations({
-        amount: form.amount,
-        propertyId: form.propertyId,
-        unitId: form.unitId || null,
-        mode: form.allocationMode,
-        units,
-        tenancies,
-        date: form.date,
-        manualAmounts,
-      })
-    : [];
-
-  const update = (field, value) => {
-    setForm((current) => ({ ...current, [field]: value }));
-  };
-
-  const changeKind = (value) => {
-    const category = firstSelectableCategory(categories, value) || categories[0];
-    setForm((current) => ({
-      ...current,
-      kind: value,
-      categoryId: category.id,
-      allocatable: value === 'expense' && category.allocatableDefault === true,
-      allocationMode: current.unitId ? 'direct' : category.allocationModeDefault || 'area',
-    }));
-    setManualAmounts({});
-    setAllocationError('');
-  };
-
-  const changeCategory = (categoryId) => {
-    const category = categories.find((item) => item.id === categoryId);
-    setForm((current) => ({
-      ...current,
-      categoryId,
-      allocatable: current.kind === 'expense' && category?.allocatableDefault === true,
-      allocationMode: current.unitId ? 'direct' : category?.allocationModeDefault || 'area',
-    }));
-    setManualAmounts({});
-  };
-
-  const changeProperty = (propertyId) => {
-    setForm((current) => ({ ...current, propertyId, unitId: '', allocationMode: selectedCategory?.allocationModeDefault || 'area' }));
-    setManualAmounts({});
-  };
-
-  const changeUnit = (unitId) => {
-    setForm((current) => ({
-      ...current,
-      unitId,
-      allocationMode: unitId ? 'direct' : selectedCategory?.allocationModeDefault || 'area',
-    }));
-    setManualAmounts({});
-  };
-
-  const submit = async (event) => {
-    event.preventDefault();
-    const servicePeriodStart = event.currentTarget.elements.servicePeriodStart?.value || '';
-    const servicePeriodEnd = event.currentTarget.elements.servicePeriodEnd?.value || '';
-    if (Boolean(servicePeriodStart) !== Boolean(servicePeriodEnd)) {
-      setAllocationError('Bitte Beginn und Ende des Leistungszeitraums gemeinsam angeben.');
-      return;
-    }
-    if (servicePeriodStart && servicePeriodEnd < servicePeriodStart) {
-      setAllocationError('Das Ende des Leistungszeitraums darf nicht vor dem Beginn liegen.');
-      return;
-    }
-    if (form.kind === 'expense' && form.allocatable && form.allocationMode === 'manual') {
-      const distributed = allocations.reduce((total, allocation) => total + allocation.amount, 0);
-      if (Math.abs(distributed - Number(form.amount)) > 0.01) {
-        setAllocationError('Die manuellen Anteile müssen zusammen genau dem Buchungsbetrag entsprechen.');
-        return;
-      }
-    }
-    if (file && file.size > 250 * 1024) {
-      setFileNote('Der Beleg ist größer als 250 KB. Bitte die Datei verkleinern.');
-      return;
-    }
-    const submittedAllocations = form.kind === 'expense' && form.allocatable
-      ? servicePeriodStart && servicePeriodEnd && form.allocationMode !== 'manual'
-        ? calculateServicePeriodAllocations({
-          amount: form.amount,
-          propertyId: form.propertyId,
-          unitId: form.unitId || null,
-          mode: form.allocationMode,
-          units,
-          tenancies,
-          tenancyUnits,
-          servicePeriodStart,
-          servicePeriodEnd,
-        })
-        : allocations
-      : [];
-    let receiptDataUrl;
-    if (file) {
-      receiptDataUrl = await readFile(file);
-    }
-    await onSubmit({
-      ...form,
-      id: 'tx-' + Date.now(),
-      amount: Number(form.amount),
-      servicePeriodStart: servicePeriodStart || null,
-      servicePeriodEnd: servicePeriodEnd || null,
-      unitId: form.unitId || null,
-      tenancyId: form.unitId
-        ? activeTenancyForUnit(tenancies, form.unitId, form.date)?.id || null
-        : null,
-      allocatable: form.kind === 'expense' ? form.allocatable : false,
-      allocationMode: form.kind === 'expense' && form.allocatable ? form.allocationMode : null,
-      allocations: submittedAllocations,
-      receiptName: file?.name,
-      receiptDataUrl,
-    });
-  };
-
-  const selectFile = (event) => {
-    const selected = event.target.files?.[0] || null;
-    setFile(selected);
-    if (!selected) {
-      setFileNote('');
-    } else if (selected.size > 250 * 1024) {
-      setFileNote('Der Beleg ist größer als 250 KB. Bitte die Datei verkleinern.');
-    } else {
-      setFileNote('Die Datei wird lokal im Browser gespeichert.');
-    }
-  };
-
-  return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section
-        className="modal modal--wide"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="transaction-title"
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <div className="modal__header">
-          <div>
-            <span className="section-kicker">Neue Bewegung</span>
-            <h2 id="transaction-title">Buchung erfassen</h2>
-          </div>
-          <button type="button" className="icon-button" aria-label="Dialog schließen" onClick={onClose}>
-            <Icon name="close" />
-          </button>
-        </div>
-
-        <form className="transaction-form" onSubmit={submit}>
-          <div className="kind-toggle">
-            <button
-              type="button"
-              className={form.kind === 'income' ? 'active' : ''}
-              onClick={() => changeKind('income')}
-            >
-              Einnahme
-            </button>
-            <button
-              type="button"
-              className={form.kind === 'expense' ? 'active' : ''}
-              onClick={() => changeKind('expense')}
-            >
-              Ausgabe
-            </button>
-          </div>
-
-          <div className="form-grid">
-            <label>
-              <span>Immobilie</span>
-              <select
-                value={form.propertyId}
-                onChange={(event) => changeProperty(event.target.value)}
-              >
-                {properties.map((property) => (
-                  <option key={property.id} value={property.id}>{property.name}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Geltungsbereich</span>
-              <select value={form.unitId} onChange={(event) => changeUnit(event.target.value)}>
-                <option value="">Gesamte Immobilie</option>
-                {propertyUnits.map((unit) => <option key={unit.id} value={unit.id}>{unit.name} · {unit.usageType}</option>)}
-              </select>
-            </label>
-            <label>
-              <span>Datum</span>
-              <input
-                type="date"
-                value={form.date}
-                onChange={(event) => update('date', event.target.value)}
-                required
-              />
-            </label>
-            <label>
-              <span>Kategorie</span>
-              <select
-                value={form.categoryId}
-                onChange={(event) => changeCategory(event.target.value)}
-              >
-                <CategorySelectOptions categories={categories} kind={form.kind} />
-              </select>
-            </label>
-            <label>
-              <span>Betrag in €</span>
-              <input
-                type="number"
-                min="0.01"
-                step="0.01"
-                value={form.amount}
-                onChange={(event) => update('amount', event.target.value)}
-                placeholder="0,00"
-                required
-              />
-            </label>
-            <label>
-              <span>Leistungszeitraum von</span>
-              <input name="servicePeriodStart" type="date" value={form.servicePeriodStart} onChange={(event) => update('servicePeriodStart', event.target.value)} />
-            </label>
-            <label>
-              <span>Leistungszeitraum bis</span>
-              <input name="servicePeriodEnd" type="date" value={form.servicePeriodEnd} onChange={(event) => update('servicePeriodEnd', event.target.value)} />
-            </label>
-            <p className="form-help form-span">Jahreskosten wie Wasser, Grundsteuer oder Gebäudeversicherung werden einmalig mit ihrem vollständigen Leistungszeitraum erfasst.</p>
-            {form.kind === 'expense' && (
-              <div className="allocation-box form-span">
-                <div className="allocation-box__header">
-                  <div>
-                    <strong>Kostenart & Mieteranteile</strong>
-                    <span>Demo-Vorschlag – Umlagefähigkeit immer mit Mietvertrag prüfen.</span>
-                  </div>
-                  <label className="switch-field">
-                    <input
-                      type="checkbox"
-                      checked={form.allocatable}
-                      onChange={(event) => update('allocatable', event.target.checked)}
-                    />
-                    <span>{form.allocatable ? 'Umlagefähig markiert' : 'Eigentümerkosten'}</span>
-                  </label>
-                </div>
-                {form.allocatable ? (
-                  <>
-                    <label className="allocation-mode-select">
-                      <span>Verteilerschlüssel</span>
-                      <select
-                        value={form.allocationMode}
-                        onChange={(event) => {
-                          update('allocationMode', event.target.value);
-                          setManualAmounts({});
-                        }}
-                      >
-                        <option value="area" disabled={Boolean(form.unitId)}>Nach Wohn-/Nutzfläche</option>
-                        <option value="equal" disabled={Boolean(form.unitId)}>Gleichmäßig je Einheit</option>
-                        <option value="direct" disabled={!form.unitId}>Direkt auf ausgewählte Einheit</option>
-                        <option value="manual">Manuell / externe Abrechnung</option>
-                      </select>
-                    </label>
-                    <div className="allocation-preview">
-                      <div className="allocation-preview__heading"><span>Einheit / Mietverhältnis</span><span>Anteil</span></div>
-                      {(form.unitId ? propertyUnits.filter((unit) => unit.id === form.unitId) : propertyUnits).map((unit) => {
-                        const tenancy = activeTenancyForUnit(tenancies, unit.id, form.date, tenancyUnits);
-                        const primary = contacts.find((contact) => contact.id === tenancy?.primaryContactId);
-                        const unitAllocations = allocations.filter((row) => row.unitId === unit.id);
-                        const allocationAmount = unitAllocations.reduce((total, row) => total + row.amount, 0);
-                        return (
-                          <div className="allocation-preview__row" key={unit.id}>
-                            <span><strong>{unit.name}</strong><small>{hasServicePeriod && unitAllocations.length > 1 ? `${unitAllocations.length} zeitanteilige Mietabschnitte` : primary?.name || 'Leerstand / kein aktives Mietverhältnis'}</small></span>
-                            {form.allocationMode === 'manual' ? (
-                              <label className="manual-amount"><input type="number" min="0" step="0.01" value={manualAmounts[unit.id] || ''} onChange={(event) => setManualAmounts((current) => ({ ...current, [unit.id]: event.target.value }))} /><span>€</span></label>
-                            ) : <strong>{moneyExact.format(allocationAmount)}</strong>}
-                          </div>
-                        );
-                      })}
-                    </div>
-                    <p className="allocation-note">{hasServicePeriod ? 'Die Vorschau verteilt zeitanteilig nach Vertrags- beziehungsweise Einzugszeiträumen. Gespeichert wird der historische Schnappschuss.' : 'Gespeichert wird ein historischer Schnappschuss der Einheit und des am Buchungsdatum aktiven Mietverhältnisses.'}</p>
-                    {allocationError && <p className="form-error">{allocationError}</p>}
-                  </>
-                ) : (
-                  <p className="owner-cost-note">Diese Ausgabe bleibt vollständig beim Eigentümer und wird keinem Mietverhältnis zugeordnet.</p>
-                )}
-              </div>
-            )}
-            <label className="form-span">
-              <span>Beschreibung</span>
-              <input
-                value={form.description}
-                onChange={(event) => update('description', event.target.value)}
-                placeholder="z. B. Heizungswartung Juli"
-                required
-              />
-            </label>
-            <label className="upload-field form-span">
-              <input type="file" accept=".pdf,image/*" onChange={selectFile} />
-              <Icon name="upload" size={24} />
-              <span>
-                <strong>{file ? file.name : 'Beleg auswählen'}</strong>
-                <small>PDF oder Bild, bis 250 KB vollständig lokal</small>
-              </span>
-            </label>
-            {fileNote && <p className="file-note form-span">{fileNote}</p>}
-          </div>
-
-          <div className="modal__footer">
-            <p>Keine Cloud: Die Demo speichert ausschließlich in diesem Browser.</p>
-            <div>
-              <button type="button" className="button button--ghost" onClick={onClose}>
-                Abbrechen
-              </button>
-              <button type="submit" className="button button--primary">
-                Buchung speichern
-              </button>
-            </div>
-          </div>
-        </form>
-      </section>
-    </div>
-  );
-}
 
 export default App;

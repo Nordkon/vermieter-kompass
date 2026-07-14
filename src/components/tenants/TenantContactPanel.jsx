@@ -15,6 +15,9 @@ export function TenantContactPanel({
   onSaveContact,
   onCreateContact,
   focusContactId = '',
+  writeBlocked = false,
+  onWriteBlocked,
+  onWriterStateChange,
 }) {
   const [query, setQuery] = useState('');
   const [kind, setKind] = useState('all');
@@ -69,6 +72,10 @@ export function TenantContactPanel({
   };
 
   const startCreating = () => {
+    if (writeBlocked) {
+      onWriteBlocked?.();
+      return;
+    }
     if (!mayDiscardDraft()) return;
     setCreating(true);
     setRecordDirty(false);
@@ -86,7 +93,7 @@ export function TenantContactPanel({
             <h3 id="tenant-directory-title">Mietparteien</h3>
             <p>{contacts.length} vollständige Kontaktakten</p>
           </div>
-          <button type="button" className="button button--primary button--small" onClick={startCreating}>
+          <button id="contact-create-trigger" type="button" className="button button--primary button--small" onClick={startCreating}>
             Neue Mietpartei
           </button>
         </div>
@@ -149,6 +156,9 @@ export function TenantContactPanel({
           }}
           dirty={recordDirty}
           onDirtyChange={setRecordDirty}
+          writeBlocked={writeBlocked}
+          onWriteBlocked={onWriteBlocked}
+          onWriterStateChange={onWriterStateChange}
         />
       </section>
     </div>

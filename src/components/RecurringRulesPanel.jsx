@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { moneyExact } from '../lib/format.js';
 import { contactDisplayName, firstDueDateOnOrAfter } from '../lib/schemaV3.js';
@@ -10,7 +10,16 @@ const frequencyLabel = {
   yearly: 'Jährlich',
 };
 
-export function RecurringRulesPanel({ rules, tenancies, contacts, onCreate, onGenerate }) {
+export function RecurringRulesPanel({
+  rules,
+  tenancies,
+  contacts,
+  onCreate,
+  onGenerate,
+  writeBlocked = false,
+  onWriteBlocked,
+  onWriterStateChange,
+}) {
   const today = new Date().toISOString().slice(0, 10);
   const availableTenancies = tenancies.filter((tenancy) => {
     const endDate = tenancy.contractEnd || tenancy.endDate || '';
@@ -28,11 +37,29 @@ export function RecurringRulesPanel({ rules, tenancies, contacts, onCreate, onGe
     amount: '',
   });
   const [error, setError] = useState('');
+
+  useEffect(() => {
+    onWriterStateChange?.({
+      id: 'recurring-rule-create',
+      label: 'Wiederholungsregel anlegen',
+      focusId: 'recurring-rule-trigger',
+      active: open,
+      dirty: open,
+    });
+  }, [open]);
+
+  useEffect(() => () => {
+    onWriterStateChange?.({ id: 'recurring-rule-create', active: false });
+  }, []);
   const selectedTenancy = availableTenancies.find((tenancy) => tenancy.id === form.tenancyId);
   const selectedTenancyStart = selectedTenancy?.contractStart || selectedTenancy?.startDate || '';
   const selectedTenancyEnd = selectedTenancy?.contractEnd || selectedTenancy?.endDate || '';
   const update = (field, value) => setForm((current) => ({ ...current, [field]: value }));
   const openForm = () => {
+    if (writeBlocked) {
+      onWriteBlocked?.();
+      return;
+    }
     setForm((current) => ({
       ...current,
       tenancyId: availableTenancies.some((tenancy) => tenancy.id === current.tenancyId)
@@ -83,8 +110,8 @@ export function RecurringRulesPanel({ rules, tenancies, contacts, onCreate, onGe
       <div className="card-header">
         <div><h3>Wiederkehrende Sollstellungen</h3><p>Monatlich, quartalsweise oder jährlich – mit deterministischem Vorkommnisschlüssel.</p></div>
         <div className="card-header__action rules-actions">
-          <button type="button" className="button button--ghost button--small" onClick={onGenerate}>Bis heute erzeugen</button>
-          <button type="button" className="button button--primary button--small" onClick={openForm} disabled={!availableTenancies.length}><Icon name="plus" size={15} /> Regel</button>
+          <button type="button" className="button button--ghost button--small" onClick={() => writeBlocked ? onWriteBlocked?.() : onGenerate()} aria-disabled={writeBlocked}>Bis heute erzeugen</button>
+          <button id="recurring-rule-trigger" type="button" className="button button--primary button--small" onClick={openForm} disabled={!availableTenancies.length} aria-disabled={writeBlocked}><Icon name="plus" size={15} /> Regel</button>
         </div>
       </div>
       <div className="rules-list">

@@ -27,6 +27,8 @@ export function AnnualSettlementPanel({
   transactions = [],
   focusTenancyId = '',
   onPostSettlement,
+  writeBlocked = false,
+  onWriteBlocked,
 }) {
   const firstTenancyId = focusTenancyId || tenancies[0]?.id || '';
   const initialPeriod = defaultPeriod(recurringRules, firstTenancyId);
@@ -92,6 +94,10 @@ export function AnnualSettlementPanel({
   );
 
   const post = async () => {
+    if (writeBlocked) {
+      onWriteBlocked?.();
+      return;
+    }
     const entry = buildSettlementAccountEntry(preview, bookingDate);
     if (!entry) {
       setMessage(preview?.alreadyPosted
@@ -160,6 +166,7 @@ export function AnnualSettlementPanel({
               className="button button--primary"
               onClick={post}
               disabled={!preview.complete || preview.alreadyPosted || !preview.result || !bookingDate || bookingDate < periodEnd}
+              aria-disabled={writeBlocked}
             >
               {preview.alreadyPosted ? 'Abschluss bereits gebucht' : 'Abrechnungsergebnis buchen'}
             </button>

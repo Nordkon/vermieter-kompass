@@ -30,14 +30,35 @@ export function TenantArea({
   onPostSettlement,
   target = null,
   onBackToOrigin = null,
+  writeBlocked = false,
+  onWriteBlocked,
+  onWriterStateChange,
 }) {
   const [activeTab, setActiveTab] = useState('contacts');
+  const [localWriter, setLocalWriter] = useState(null);
+
+  const reportWriterState = (writer) => {
+    setLocalWriter((current) => {
+      if (!writer?.active) return !writer?.id || current?.id === writer.id ? null : current;
+      return writer;
+    });
+    onWriterStateChange?.(writer);
+  };
+
+  const changeTab = (tabId) => {
+    if (tabId === activeTab) return;
+    if (localWriter?.dirty && !window.confirm(`${localWriter.label}: ungespeicherte Änderungen verwerfen und den Bereich wechseln?`)) return;
+    if (localWriter) reportWriterState({ id: localWriter.id, active: false });
+    setActiveTab(tabId);
+  };
 
   useEffect(() => {
-    if (target?.tab && TABS.some((tab) => tab.id === target.tab)) {
-      setActiveTab(target.tab);
-    }
-  }, [target]);
+    const targetTab = target?.tab;
+    if (!targetTab || targetTab === activeTab || !TABS.some((tab) => tab.id === targetTab)) return;
+    if (localWriter?.dirty && !window.confirm(`${localWriter.label}: ungespeicherte Änderungen verwerfen und den Bereich wechseln?`)) return;
+    if (localWriter) reportWriterState({ id: localWriter.id, active: false });
+    setActiveTab(targetTab);
+  }, [target?.tab]);
 
   return (
     <div className="tenant-area">
@@ -73,7 +94,7 @@ export function TenantArea({
             aria-selected={activeTab === tab.id}
             className={activeTab === tab.id ? 'active' : ''}
             key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => changeTab(tab.id)}
           >
             {tab.label}
           </button>
@@ -98,6 +119,9 @@ export function TenantArea({
             onSaveContact={onSaveContact}
             onCreateContact={onCreateContact}
             focusContactId={target?.contactId || ''}
+            writeBlocked={writeBlocked}
+            onWriteBlocked={onWriteBlocked}
+            onWriterStateChange={reportWriterState}
           />
         )}
         {activeTab === 'tenancies' && (
@@ -111,6 +135,9 @@ export function TenantArea({
             onCreateTenancy={onCreateTenancy}
             focusTenancyId={target?.tenancyId || ''}
             initialUnitId={target?.unitId || ''}
+            writeBlocked={writeBlocked}
+            onWriteBlocked={onWriteBlocked}
+            onWriterStateChange={reportWriterState}
           />
         )}
         {activeTab === 'accounts' && (
@@ -128,6 +155,9 @@ export function TenantArea({
               onVoidPayment={onVoidPayment}
               onGenerateEntries={onGenerateEntries}
               focusTenancyId={target?.tenancyId || ''}
+              writeBlocked={writeBlocked}
+              onWriteBlocked={onWriteBlocked}
+              onWriterStateChange={reportWriterState}
             />
             <AnnualSettlementPanel
               contacts={contacts}
@@ -141,6 +171,9 @@ export function TenantArea({
               transactions={transactions}
               onPostSettlement={onPostSettlement}
               focusTenancyId={target?.tenancyId || ''}
+              writeBlocked={writeBlocked}
+              onWriteBlocked={onWriteBlocked}
+              onWriterStateChange={reportWriterState}
             />
           </>
         )}

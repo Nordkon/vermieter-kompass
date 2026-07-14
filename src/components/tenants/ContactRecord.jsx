@@ -65,6 +65,7 @@ function ContactForm({
   contact,
   creating,
   sourceProperties,
+  focusId,
   dirty,
   onDirtyChange,
   onCancel,
@@ -127,7 +128,7 @@ function ContactForm({
       <div className="form-grid tenant-contact-form__grid">
         <label>
           <span>Art der Mietpartei</span>
-          <select name="kind" value={form.kind} onChange={(event) => update('kind', event.target.value)} aria-label="Art der Mietpartei">
+          <select id={focusId} name="kind" value={form.kind} onChange={(event) => update('kind', event.target.value)} aria-label="Art der Mietpartei">
             <option value="person">Person</option>
             <option value="company">Firma</option>
           </select>
@@ -199,10 +200,15 @@ export function ContactRecord({
   onSaved,
   dirty: controlledDirty,
   onDirtyChange,
+  writeBlocked = false,
+  onWriteBlocked,
+  onWriterStateChange,
 }) {
   const [editing, setEditing] = useState(false);
   const [internalDirty, setInternalDirty] = useState(false);
   const dirty = controlledDirty ?? internalDirty;
+  const writerId = creating ? 'contact-create' : `contact-edit-${contact?.id || 'unknown'}`;
+  const writerFocusId = `contact-form-focus-${writerId}`;
   const setDirty = (value) => {
     setInternalDirty(value);
     onDirtyChange?.(value);
@@ -226,6 +232,20 @@ export function ContactRecord({
     setDirty(false);
   }, [contact?.id, creating]);
 
+  useEffect(() => {
+    onWriterStateChange?.({
+      id: writerId,
+      label: creating ? 'Neue Mietpartei' : 'Kontaktakte bearbeiten',
+      focusId: writerFocusId,
+      active: creating || editing,
+      dirty,
+    });
+  }, [creating, dirty, editing, writerId]);
+
+  useEffect(() => () => {
+    onWriterStateChange?.({ id: writerId, active: false });
+  }, [writerId]);
+
   const save = async (payload) => {
     const saved = await onSave?.(payload);
     if (saved === false) return;
@@ -240,6 +260,14 @@ export function ContactRecord({
     else setEditing(false);
   };
 
+  const startEditing = () => {
+    if (writeBlocked) {
+      onWriteBlocked?.();
+      return;
+    }
+    setEditing(true);
+  };
+
   if (!creating && !contact) return <div className="empty-state">Lege zuerst eine Mietpartei an.</div>;
 
   return (
@@ -250,7 +278,7 @@ export function ContactRecord({
           <p>Personendaten bleiben vom Mietverhältnis getrennt.</p>
         </div>
         {!creating && !editing && (
-          <button type="button" className="button button--primary button--small" onClick={() => setEditing(true)}>Bearbeiten</button>
+          <button id="contact-record-editor-trigger" type="button" className="button button--primary button--small" onClick={startEditing} aria-disabled={writeBlocked}>Bearbeiten</button>
         )}
       </div>
       {(creating || editing) ? (
@@ -259,6 +287,7 @@ export function ContactRecord({
           contact={creating ? null : contact}
           creating={creating}
           sourceProperties={sourceProperties}
+          focusId={writerFocusId}
           dirty={dirty}
           onDirtyChange={setDirty}
           onCancel={cancel}

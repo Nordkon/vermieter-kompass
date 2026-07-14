@@ -18,7 +18,7 @@ const entryDefaults = {
   settlement: { side: 'debit', description: 'Betriebskostenabrechnung' },
 };
 
-function AccountEntryForm({ defaultTenancyId, tenancies, tenancyLabel, onSubmit }) {
+function AccountEntryForm({ defaultTenancyId, tenancies, tenancyLabel, onSubmit, onWriterStateChange }) {
   const [form, setForm] = useState({
     tenancyId: defaultTenancyId || '',
     entryType: 'payment',
@@ -31,6 +31,21 @@ function AccountEntryForm({ defaultTenancyId, tenancies, tenancyLabel, onSubmit 
   });
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [dirty, setDirty] = useState(false);
+
+  useEffect(() => {
+    onWriterStateChange?.({
+      id: 'tenant-account-entry',
+      label: 'Kontobuchung erfassen',
+      focusId: 'tenant-account-entry-form',
+      active: dirty,
+      dirty,
+    });
+  }, [dirty]);
+
+  useEffect(() => () => {
+    onWriterStateChange?.({ id: 'tenant-account-entry', active: false });
+  }, []);
 
   useEffect(() => {
     if (defaultTenancyId) {
@@ -38,10 +53,13 @@ function AccountEntryForm({ defaultTenancyId, tenancies, tenancyLabel, onSubmit 
     }
   }, [defaultTenancyId]);
 
-  const update = (field, value) => setForm((current) => {
-    if (field === 'entryType') return { ...current, entryType: value, ...entryDefaults[value] };
-    return { ...current, [field]: value };
-  });
+  const update = (field, value) => {
+    setDirty(true);
+    setForm((current) => {
+      if (field === 'entryType') return { ...current, entryType: value, ...entryDefaults[value] };
+      return { ...current, [field]: value };
+    });
+  };
 
   const submit = async (event) => {
     event.preventDefault();
@@ -84,11 +102,14 @@ function AccountEntryForm({ defaultTenancyId, tenancies, tenancyLabel, onSubmit 
       servicePeriodEnd,
     }));
     setSubmitting(false);
-    if (saved !== false) setForm((current) => ({ ...current, amount: '' }));
+    if (saved !== false) {
+      setForm((current) => ({ ...current, amount: '' }));
+      setDirty(false);
+    }
   };
 
   return (
-    <form className="transaction-form tenant-payment-form" onSubmit={submit} noValidate>
+    <form id="tenant-account-entry-form" className="transaction-form tenant-payment-form" onSubmit={submit} noValidate tabIndex={-1}>
       <div className="form-grid tenant-payment-form__grid">
         <label className="tenant-payment-form__account">
           <span>Mieterkonto *</span>
@@ -191,6 +212,9 @@ export function TenantAccountPanel({
   onGenerateEntries,
   onVoidPayment,
   focusTenancyId = '',
+  writeBlocked = false,
+  onWriteBlocked,
+  onWriterStateChange,
 }) {
   const [tenancyId, setTenancyId] = useState('');
   const [side, setSide] = useState('all');
@@ -230,6 +254,10 @@ export function TenantAccountPanel({
   )).length;
 
   const generateEntries = () => {
+    if (writeBlocked) {
+      onWriteBlocked?.();
+      return;
+    }
     const requestedThroughDate = throughDateInputRef.current?.value || throughDate;
     if (!requestedThroughDate) return;
     setThroughDate(requestedThroughDate);
@@ -237,6 +265,10 @@ export function TenantAccountPanel({
   };
 
   const voidPayment = async (entry) => {
+    if (writeBlocked) {
+      onWriteBlocked?.();
+      return;
+    }
     if (typeof onVoidPayment !== 'function' || voidingPaymentKey) return;
     const confirmed = window.confirm(
       'Diese Zahlung wird gemeinsam aus Mieterkonto und Finanzen entfernt. Möchtest du die Mietzahlung wirklich stornieren?',
@@ -302,6 +334,7 @@ export function TenantAccountPanel({
               className="button button--ghost button--small"
               onClick={generateEntries}
               disabled={!throughDate || !activeRuleCount}
+              aria-disabled={writeBlocked}
             >
               Sollstellungen erzeugen ({activeRuleCount})
             </button>
@@ -390,6 +423,7 @@ export function TenantAccountPanel({
                           className="tenant-account-ledger__void-button"
                           onClick={() => voidPayment(entry)}
                           disabled={Boolean(voidingPaymentKey)}
+                          aria-disabled={writeBlocked}
                           aria-label={`Mietzahlung ${entry.description || dateLabel(entry.bookingDate || entry.dueDate)} stornieren`}
                         >
                           {isVoidingPayment ? 'Wird storniert …' : 'Mietzahlung stornieren'}
@@ -439,12 +473,18 @@ export function TenantAccountPanel({
             <p>Zahlungen, Korrekturen und nur das Ergebnis einer Abrechnung werden dem Mietverhältnis zugeordnet.</p>
           </div>
         </div>
-        {tenancies.length ? (
+        {writeBlocked ? (
+          <div className="info-banner">
+            <div><strong>Buchungsentwurf ist geöffnet</strong><span>Speichere oder verwirf ihn, bevor du das Mieterkonto bearbeitest.</span></div>
+            <button type="button" className="button button--ghost button--small" onClick={onWriteBlocked}>Entwurf anzeigen</button>
+          </div>
+        ) : tenancies.length ? (
           <AccountEntryForm
             defaultTenancyId={tenancyId}
             tenancies={tenancies}
             tenancyLabel={tenancyLabel}
             onSubmit={(payload) => onAddAccountEntry?.(payload)}
+            onWriterStateChange={onWriterStateChange}
           />
         ) : (
           <div className="empty-state">Für eine Zahlung wird zuerst ein Mietverhältnis benötigt.</div>

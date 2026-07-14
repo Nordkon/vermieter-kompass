@@ -359,6 +359,9 @@ export function TenancyPanel({
   onCreateTenancy,
   focusTenancyId = '',
   initialUnitId = '',
+  writeBlocked = false,
+  onWriteBlocked,
+  onWriterStateChange,
 }) {
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState('all');
@@ -366,10 +369,24 @@ export function TenancyPanel({
   const [showForm, setShowForm] = useState(false);
 
   useEffect(() => {
-    if (initialUnitId && units.some((unit) => unit.id === initialUnitId && unit.unitKind !== 'ancillary')) {
+    onWriterStateChange?.({
+      id: 'tenancy-create',
+      label: 'Neues Mietverhältnis',
+      focusId: 'tenancy-editor-trigger',
+      active: showForm,
+      dirty: showForm,
+    });
+  }, [showForm]);
+
+  useEffect(() => () => {
+    onWriterStateChange?.({ id: 'tenancy-create', active: false });
+  }, []);
+
+  useEffect(() => {
+    if (!writeBlocked && initialUnitId && units.some((unit) => unit.id === initialUnitId && unit.unitKind !== 'ancillary')) {
       setShowForm(true);
     }
-  }, [initialUnitId]);
+  }, [initialUnitId, writeBlocked]);
 
   useEffect(() => {
     if (!focusTenancyId || !tenancies.some((tenancy) => tenancy.id === focusTenancyId)) return;
@@ -419,9 +436,17 @@ export function TenancyPanel({
             <p>Vertrag, Belegung und Mietparteien als getrennte Beziehungen.</p>
           </div>
           <button
+            id="tenancy-editor-trigger"
             type="button"
             className="button button--primary button--small"
-            onClick={() => setShowForm((current) => !current)}
+            onClick={() => {
+              if (!showForm && writeBlocked) {
+                onWriteBlocked?.();
+                return;
+              }
+              setShowForm((current) => !current);
+            }}
+            aria-disabled={!showForm && writeBlocked}
           >
             {showForm ? 'Formular schließen' : 'Neues Mietverhältnis'}
           </button>
